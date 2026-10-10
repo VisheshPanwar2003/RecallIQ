@@ -59,3 +59,38 @@ class SemanticMatch(BaseModel):
 
 class SemanticSearchResponse(BaseModel):
     results: list[SemanticMatch]
+
+
+# All retrieval modes share the same bounded request validation.
+class KeywordSearchRequest(SemanticSearchRequest):
+    pass
+
+
+class HybridSearchRequest(SemanticSearchRequest):
+    pass
+
+
+class SourceMatch(BaseModel):
+    document_id: UUID
+    filename: str
+    chunk_id: UUID
+    page_number: int
+    chunk_text: str
+
+
+class KeywordMatch(SourceMatch):
+    bm25_score: float
+
+
+class KeywordSearchResponse(BaseModel):
+    results: list[KeywordMatch]
+
+
+class HybridMatch(SourceMatch):
+    rrf_score: float
+    keyword_rank: int | None
+    semantic_rank: int | None
+
+
+class HybridSearchResponse(BaseModel):
+    results: list[HybridMatch]

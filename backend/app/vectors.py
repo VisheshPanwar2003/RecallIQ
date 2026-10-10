@@ -58,7 +58,7 @@ class VectorIndex:
                 } for chunk in batch],
             )
 
-    def complete(self, document_id, generation, chunk_count, config):
+    def complete(self, document_id, generation, chunk_count, config, *, chunk_ids=None):
         collection = self.collection(config, create=False)
         if collection is None:
             return False
@@ -66,6 +66,8 @@ class VectorIndex:
             where={"$and": [{"document_id": document_id}, {"generation": generation}]},
             include=[],
         )
+        if chunk_ids is not None:
+            return set(result["ids"]) == {f"{generation}:{chunk_id}" for chunk_id in chunk_ids}
         return len(result["ids"]) == chunk_count
 
     def remove(self, document_id, config, keep_generation=None):

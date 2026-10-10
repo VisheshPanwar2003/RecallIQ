@@ -1,11 +1,11 @@
 # RecallIQ
 
 Privacy-Aware Intelligent Knowledge Assistant. A local-first application with
-a FastAPI backend, PDF document management and local semantic retrieval.
+a FastAPI backend, PDF document management and local semantic, keyword and hybrid retrieval.
 
 ## Development status and current features
 
-The backend foundation, PDF extraction, SQLite management and semantic search are implemented:
+The backend foundation, PDF extraction, SQLite management and all three retrieval modes are implemented:
 
 - `GET /` and `GET /health`, Swagger UI and an OpenAPI schema.
 - `POST /documents/upload` accepts one PDF up to 20 MiB (20 × 1024 × 1024 bytes).
@@ -13,6 +13,7 @@ The backend foundation, PDF extraction, SQLite management and semantic search ar
 - Local UUID-based file storage and per-page text extraction with character counts.
 - SQLite metadata persistence, document listing, details and recoverable deletion.
 - Page-aware overlapping chunks, local Sentence Transformer embeddings and persistent ChromaDB search.
+- SQLite FTS5 keyword search with BM25 and Reciprocal Rank Fusion (RRF) hybrid search.
 - Automated tests using generated PDFs and isolated temporary directories.
 
 There is no authentication, encryption, LLM answer generation, RAG or agent integration.
@@ -20,7 +21,7 @@ There is no authentication, encryption, LLM answer generation, RAG or agent inte
 ## Planned features (not implemented)
 
 - Broader document ingestion and knowledge management.
-- Hybrid semantic and keyword retrieval and an encrypted local vault.
+- An encrypted local vault.
 - System 1/System 2 routing and local LLM support through Ollama.
 - Agentic RAG through LangGraph.
 - Privacy guardrails and explicit consent for optional cloud requests.
@@ -32,7 +33,7 @@ Current stack: Python, FastAPI, Uvicorn, PyMuPDF, python-multipart, built-in sql
 Sentence Transformers, ChromaDB, pytest and httpx. SQLite requires no additional package.
 PyMuPDF opens PDFs and extracts text; python-multipart parses upload form data.
 All direct dependencies and their versions are listed in `backend/requirements.txt`.
-Install Python 3.11 or newer and Git. Commands below use Windows PowerShell.
+Install Python 3.11 or newer with SQLite FTS5 support, and Git. Commands below use Windows PowerShell.
 For a new checkout, clone the repository and enter its root:
 
 ```powershell
@@ -124,7 +125,7 @@ and closes when finished. SQL values use parameterized queries.
 The table stores `id` (UUID primary key), `original_filename`, `stored_filename`
 (unique UUID filename), `file_size_bytes`, `total_pages`, `total_characters`, and
 `created_at` (UTC). Required fields and nonnegative integer counts are constrained.
-PDF bytes and extracted page text are not stored in SQLite. Upload responses remain
+PDF bytes are not stored in SQLite; indexing stores searchable chunk text there. Upload responses remain
 unchanged; metadata insertion failure removes the newly created PDF.
 
 Default locations are `backend/data/recalliq.sqlite3` and `backend/uploads/`.
@@ -233,18 +234,30 @@ from stored chunks; there is no conversational answer generation.
 ## Indexing and deletion consistency
 
 SQLite `document_indexes` records the active content/configuration generation;
+`keyword_indexes` records the matching keyword generation and expected chunk count.
 `vector_cleanup` is a durable queue of deleted document UUIDs. Chroma upserts
-deterministic generation/chunk IDs before SQLite activates the generation. Partial
+deterministic generation/chunk IDs before SQLite writes chunks, updates FTS through
+triggers and activates both manifests in one SQLite transaction. The vector ID is
+`<generation>:<chunk_id>`; FTS resolves the same logical chunk UUID through its rowid.
+Partial
 new generations remain hidden; reindexing retries the same IDs. A failed changed-content
 reindex preserves the previous active generation. Success removes old/partial generations.
 A cleanup failure after activation can return 500 even though the new generation is
 complete; retrying indexing finishes cleanup without duplicating chunks.
-Reindexing unchanged content verifies chunk count, reuses a complete generation and
-retries cleanup; missing vector data can be reconstructed by reindexing.
+Reindexing verifies expected vector IDs, reuses a complete generation and rewrites
+keyword rows transactionally, then retries cleanup. This repairs missing keyword
+data without re-embedding, including after a failed SQLite commit. Missing vector
+data is reconstructed by reindexing; its old matching manifests are first hidden.
+Old semantic-only indexes remain usable through semantic search after migration,
+but require explicit reindexing before keyword or hybrid search can use them.
+Hybrid checks matching manifests, keyword row counts and vector counts; incomplete
+documents are excluded. Keyword search works without loading an embedding model.
 
-Deletion preserves the staged-file transaction and queues vector removal in the same
-SQLite transaction. It then removes document vectors. If vector cleanup fails, the API
-returns 500 and leaves the queue entry. The next indexing, search or deletion request
+Deletion preserves the staged-file transaction, cascades removal of chunk and keyword
+manifest rows, updates FTS through deletion triggers and queues vector removal in the same
+SQLite transaction. A keyword cleanup failure rolls back metadata and restores the PDF;
+fix the underlying storage issue and retry deletion. It then removes document vectors. If vector cleanup fails, the API
+returns 500 and leaves the queue entry. The next indexing, semantic/hybrid search or deletion request
 retries queued removals without needing to load an embedding model. Startup recovers
 PDF deletion; vector cleanup stays lazy. Searches filter against live SQLite metadata
 and active generations before and after querying, so deleted/partial chunks never
@@ -255,6 +268,126 @@ Uvicorn process: a process-local lock serializes indexing/search/deletion. Concu
 multi-process writers are not supported. Crash-abandoned inactive generations may occupy
 disk until safe reindexing or document deletion removes them. Back up SQLite, uploads
 and Chroma together, and keep configuration stable between restarts.
+
+## Keyword and hybrid search
+
+`POST /search/keyword` matches literal words and phrases with SQLite FTS5.
+`POST /search/semantic` matches embedding similarity and keeps its existing response.
+`POST /search/hybrid` combines the two ranked candidate lists. All accept the same
+nonblank query (at most 2000 characters), strict integer `top_k` (1..20), and optional
+`document_ids` (at most 100 UUIDs; omitted/empty means all eligible documents).
+Unknown document filters and empty indexes return `{"results": []}`.
+
+Example keyword request:
+
+```json
+{"query": "ResNet-50", "top_k": 5, "document_ids": []}
+```
+
+Keyword response example (IDs/text/scores are illustrative):
+
+```json
+{
+  "results": [{
+    "document_id": "70ca7e53-3448-4162-952c-d4d14a1d344e",
+    "filename": "residual_network_sample.pdf",
+    "chunk_id": "7f904f13-fd5e-55fe-ba8c-693e0a77be56",
+    "page_number": 2,
+    "chunk_text": "ResNet-50 uses residual skip connections.",
+    "bm25_score": -0.4377
+  }]
+}
+```
+
+BM25 is ordered ascending: SQLite's negative scores make lower values better.
+Scores depend on corpus term statistics and document length, even when filtering
+to selected documents. They are not confidence probabilities and should not be
+compared directly with cosine distances. Chunk UUID breaks equal-score ties.
+See the [SQLite FTS5 documentation](https://www.sqlite.org/fts5.html) for tokenizer,
+external-content table and BM25 details.
+
+The tokenizer is `unicode61 remove_diacritics 2`: case-insensitive with Latin
+diacritic normalization and punctuation separators. `ResNet-50` and `resnet_50`
+become the adjacent-token phrase `resnet 50`; acronyms such as NASA work as words.
+Whitespace-separated terms are combined with OR; double quotes require adjacent
+tokens (`"skip connections"`). Query values are SQL-bound parameters. A small literal
+query builder strips FTS operators and quotes each token group, so `*`, column
+selectors, SQL fragments, unmatched quotes and punctuation cannot execute SQL or
+FTS syntax. Punctuation-only queries produce no lexical matches. Operators such as
+AND/OR are treated as words; advanced FTS expressions are intentionally unsupported.
+There is no stemming, prefix matching, stopword removal, synonym expansion or fuzzy
+matching: `rocket` does not match `rockets`. The alphanumeric query splitter and
+Unicode61 tokenizer are not language-specific word segmenters; combining marks,
+symbol-heavy identifiers such as C++, and scripts without spaces can lose distinctions
+or match poorly. Quote a multiword phrase when adjacency is important.
+
+Hybrid example in PowerShell:
+
+```powershell
+$body = @{
+    query = "How does ResNet-50 solve vanishing gradients?"
+    top_k = 5
+    document_ids = @($documentId)
+} | ConvertTo-Json
+Invoke-RestMethod -Method Post "http://127.0.0.1:8000/search/hybrid" `
+    -ContentType "application/json" -Body $body
+```
+
+Hybrid matches use the same source fields, with `rrf_score`, `keyword_rank` and
+`semantic_rank` instead of BM25/distance. Ranks start at 1; an absent retriever's
+rank is null. Each retriever contributes `1 / (60 + rank)`, summed by chunk UUID.
+For a chunk ranked first in both lists, the score is `2/61`, about `0.032787`:
+
+```json
+{
+  "results": [{
+    "document_id": "70ca7e53-3448-4162-952c-d4d14a1d344e",
+    "filename": "residual_network_sample.pdf",
+    "chunk_id": "7f904f13-fd5e-55fe-ba8c-693e0a77be56",
+    "page_number": 2,
+    "chunk_text": "ResNet-50 uses residual skip connections.",
+    "rrf_score": 0.03278688524590164,
+    "keyword_rank": 1,
+    "semantic_rank": 1
+  }]
+}
+```
+
+Higher RRF scores rank first; chunk UUID breaks ties. RRF is a ranking score,
+not a probability or cosine similarity. A retriever with no hits contributes nothing;
+both empty yields no results. Retrieval failures return safe errors rather than
+silently disguising an unavailable model/store as an empty list. There is no LLM reranker.
+`RECALLIQ_SEARCH_CANDIDATES` controls candidates per retriever (default 50, allowed
+1..200, raised to at least `top_k`). Larger pools improve fusion coverage at extra cost.
+Semantic nearest-neighbor search has no relevance threshold, so it can return weak
+matches even when the keyword list is empty. This is retrieval, not answer generation.
+
+### Additive SQLite migration
+
+Startup/lazy initialization checks FTS5 with a temporary virtual table. Unsupported
+builds fail with a clear message; use a Python distribution compiled with FTS5.
+No dependency or database server is added. `schema_migrations` records additive
+migration version 1. A write transaction creates `chunks`, `keyword_indexes`, the
+external-content `chunks_fts` table and insert/update/delete triggers, then records
+the version. Repeated initialization is safe; failure rolls back the migration.
+Existing documents, semantic manifests and deletion recovery records are preserved.
+
+`chunks` stores one SQLite copy of text plus chunk UUID, document UUID, generation,
+page number and order. A unique document/generation/chunk key prevents duplicate
+rows, and document foreign keys cascade deletion. FTS uses `chunks.rowid` and stores
+the inverted index without an extra full-text content table. Chroma still holds its
+own passage copy for semantic responses; derived plaintext duplication across stores
+remains. Existing PDFs require calling `/documents/{id}/index` once after upgrading
+to populate keyword data; no upload or destructive metadata rebuild is needed.
+
+FTS text and posting lists, Chroma data, SQLite and PDFs are **unencrypted**.
+All three retrieval modes run locally and do not send queries or text to AI APIs.
+The future vault must protect source files, derived text, indexes, database journals
+and backups. Deleting a document removes its logical records but does not guarantee
+forensic erasure of SQLite/Chroma pages or backups. Manual corruption of FTS posting
+lists is not detected on every search; restore a consistent backup or reindex affected
+documents. This project supports normal retries and crash recovery, not arbitrary
+manual edits to storage internals.
 
 ## Optional real-model verification
 
@@ -296,6 +429,15 @@ The 120-character overlap does not guarantee coverage of every truncated token.
 Token-aware splitting is not implemented; smaller character chunks can reduce but
 cannot guarantee elimination of this limitation.
 
+Keyword/hybrid real-model verification also passed on 2026-10-10, offline using
+cached pinned weights and isolated persistent stores. `ResNet-50`, the paraphrase
+"What allows very deep networks to learn without their training signal fading?",
+and a hybrid ResNet question all ranked page 2 of a generated
+`residual_network_sample.pdf` first. The passage explains residual skip connections
+and shortcut pathways carrying error signals through many layers. Correct UUID,
+filename, page, strict filtering, reindexing (three total chunks across two PDFs,
+unchanged in both stores) and deletion were verified. Generated artifacts are ignored.
+
 ## Known limitations
 
 - PDFs, SQLite metadata, chunk text, embeddings and vector indexes are stored locally
@@ -308,13 +450,14 @@ cannot guarantee elimination of this limitation.
   document structure or verify the accuracy of retrieved text.
 - Full extracted text is returned temporarily by upload for development. Metadata
   endpoints do not return it. Search returns matching chunk text; there is no LLM
-  generation, keyword/hybrid retrieval or upload deduplication yet.
+  generation or upload deduplication yet.
 - Character-based chunks may exceed the model's 256-token window and be truncated,
   especially for non-English text. Retrieval is approximate and has no relevance cutoff.
 - SQLite and filesystem changes cannot be fully atomic. Staged deletion handles normal
   rollback and restart recovery; a process crash during upload can leave an unindexed
   file. Existing PDFs from before SQLite support are not automatically imported.
-- There is no migration framework, pagination or concurrent backup mechanism yet.
+- Schema migrations are small, explicit additive steps; there is no heavyweight
+  migration framework, pagination or concurrent backup mechanism yet.
 - The limit is enforced while copying from FastAPI's spooled upload in 64 KiB chunks.
   Multipart parsing happens first; this is not an incoming request-body quota.
 - There are no page-count or extracted-output limits yet; keep this development
@@ -332,6 +475,9 @@ Set-Location D:\RecallIQ\backend
 Tests cover existing endpoints, documentation, PDF extraction and rejection cases,
 size boundaries and cleanup failures. PDFs are generated in memory, and storage
 is redirected to pytest temporary directories; real uploads are never used.
+Keyword/hybrid tests use real temporary FTS5 and Chroma stores with deterministic
+fake embeddings, covering migration, query syntax, BM25, RRF, filtering, stable IDs,
+partial failures, retries, persistence and deletion. Normal tests need no internet.
 
 ## Files and concepts
 
@@ -349,7 +495,9 @@ is redirected to pytest temporary directories; real uploads are never used.
 - `backend/app/embeddings.py`: lazy local model loading and batched embeddings.
 - `backend/app/vectors.py`: persistent Chroma storage and retrieval.
 - `backend/app/semantic.py`: indexing manifests, filtering and cleanup recovery.
-- `backend/app/search.py`: validated semantic retrieval endpoint.
+- `backend/app/keyword.py`: literal queries, SQLite chunk storage and BM25 retrieval.
+- `backend/app/hybrid.py`: candidate selection and Reciprocal Rank Fusion.
+- `backend/app/search.py`: validated semantic, keyword and hybrid retrieval endpoints.
 - `backend/tests/`: health, documentation and PDF tests using FastAPI's TestClient.
 - `backend/requirements.txt`: direct dependencies with pinned versions;
   pip also installs their required dependencies.

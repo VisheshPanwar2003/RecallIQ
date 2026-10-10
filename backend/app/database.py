@@ -12,6 +12,66 @@ from app.schemas import DocumentUploadResponse
 BACKEND_DIRECTORY = Path(__file__).resolve().parents[1]
 
 
+class FTSUnavailable(RuntimeError):
+    pass
+
+
+def migrate_keyword_schema(connection):
+    """Additive, transactional migration; existing metadata/manifests stay intact."""
+    try:
+        connection.execute("CREATE VIRTUAL TABLE temp.fts_probe USING fts5(text)")
+    except sqlite3.OperationalError as error:
+        raise FTSUnavailable("SQLite FTS5 is required. Use a Python build with FTS5 support.") from error
+    connection.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)")
+    if connection.execute("SELECT 1 FROM schema_migrations WHERE version = 1").fetchone():
+        return
+    connection.execute("""
+        CREATE TABLE chunks (
+            rowid INTEGER PRIMARY KEY,
+            chunk_id TEXT NOT NULL,
+            document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            generation TEXT NOT NULL,
+            page_number INTEGER NOT NULL CHECK(page_number >= 1),
+            chunk_order INTEGER NOT NULL CHECK(chunk_order >= 0),
+            text TEXT NOT NULL,
+            UNIQUE(document_id, generation, chunk_id)
+        )
+    """)
+    try:
+        connection.execute("""
+            CREATE VIRTUAL TABLE chunks_fts USING fts5(
+                text, content='chunks', content_rowid='rowid',
+                tokenize='unicode61 remove_diacritics 2'
+            )
+        """)
+    except sqlite3.OperationalError as error:
+        raise FTSUnavailable("SQLite FTS5 is required. Use a Python build with FTS5 support.") from error
+    connection.execute("""
+        CREATE TABLE keyword_indexes (
+            document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+            generation TEXT NOT NULL,
+            chunk_count INTEGER NOT NULL CHECK(chunk_count >= 0)
+        )
+    """)
+    connection.execute("""
+        CREATE TRIGGER chunks_insert AFTER INSERT ON chunks BEGIN
+            INSERT INTO chunks_fts(rowid, text) VALUES (new.rowid, new.text);
+        END
+    """)
+    connection.execute("""
+        CREATE TRIGGER chunks_delete AFTER DELETE ON chunks BEGIN
+            INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+        END
+    """)
+    connection.execute("""
+        CREATE TRIGGER chunks_update AFTER UPDATE ON chunks BEGIN
+            INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+            INSERT INTO chunks_fts(rowid, text) VALUES (new.rowid, new.text);
+        END
+    """)
+    connection.execute("INSERT INTO schema_migrations(version) VALUES (1)")
+
+
 def get_database_path() -> Path:
     value = Path(os.environ.get("RECALLIQ_DATABASE_PATH", "data/recalliq.sqlite3"))
     return value if value.is_absolute() else BACKEND_DIRECTORY / value
@@ -32,6 +92,7 @@ def connect(path: Path):
 def initialize_database(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with connect(path) as connection:
+        connection.execute("BEGIN IMMEDIATE")
         connection.execute("""
             CREATE TABLE IF NOT EXISTS documents (
                 id TEXT PRIMARY KEY NOT NULL CHECK(length(id) = 36),
@@ -55,6 +116,7 @@ def initialize_database(path: Path) -> None:
                 document_id TEXT PRIMARY KEY NOT NULL
             )
         """)
+        migrate_keyword_schema(connection)
 
 
 class DocumentStore:
@@ -94,5 +156,7 @@ class DocumentStore:
 def get_document_store(path: Path = Depends(get_database_path)) -> DocumentStore:
     try:
         return DocumentStore(path)
+    except FTSUnavailable as error:
+        raise HTTPException(503, str(error)) from error
     except (sqlite3.Error, OSError) as error:
         raise HTTPException(500, "Document storage is unavailable.") from error
