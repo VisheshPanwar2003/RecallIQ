@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 from typing import BinaryIO
 from uuid import uuid4
 
@@ -18,11 +19,12 @@ class UploadRejected(ValueError):
 
 
 def get_uploads_directory() -> Path:
-    return UPLOADS_DIRECTORY
+    value = Path(os.environ.get("RECALLIQ_UPLOADS_DIRECTORY", str(UPLOADS_DIRECTORY)))
+    return value if value.is_absolute() else UPLOADS_DIRECTORY.parent / value
 
 
 def store_and_extract(
-    stream: BinaryIO, filename: str, directory: Path
+    stream: BinaryIO, filename: str, directory: Path, store=None
 ) -> DocumentUploadResponse:
     if not filename.lower().endswith(".pdf"):
         raise UploadRejected("Only files with a .pdf extension are supported.")
@@ -61,6 +63,8 @@ def store_and_extract(
             total_characters=sum(page.character_count for page in pages),
             pages=pages,
         )
+        if store is not None:
+            store.insert(result, size)
         retained = True
         return result
     finally:

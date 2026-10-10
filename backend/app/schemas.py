@@ -1,4 +1,5 @@
 from uuid import UUID
+from datetime import datetime
 
 from pydantic import BaseModel
 
@@ -15,3 +16,12 @@ class DocumentUploadResponse(BaseModel):
     total_pages: int
     total_characters: int
     pages: list[ExtractedPage]
+
+
+class DocumentMetadata(BaseModel):
+    id: UUID
+    original_filename: str
+    file_size_bytes: int
+    total_pages: int
+    total_characters: int
+    created_at: datetime

@@ -5,15 +5,16 @@ a FastAPI backend and local PDF upload and text extraction.
 
 ## Development status and current features
 
-The backend foundation and PDF Upload & Text Extraction are implemented:
+The backend foundation, PDF extraction and SQLite document management are implemented:
 
 - `GET /` and `GET /health`, Swagger UI and an OpenAPI schema.
 - `POST /documents/upload` accepts one PDF up to 20 MiB (20 × 1024 × 1024 bytes).
 - Case-insensitive extension, signature, PDF structure and encryption checks.
 - Local UUID-based file storage and per-page text extraction with character counts.
+- SQLite metadata persistence, document listing, details and recoverable deletion.
 - Automated tests using generated PDFs and isolated temporary directories.
 
-There is no database, authentication, encryption of stored uploads or AI integration.
+There is no authentication, encryption of stored uploads or AI integration.
 
 ## Planned features (not implemented)
 
@@ -26,7 +27,8 @@ There is no database, authentication, encryption of stored uploads or AI integra
 
 ## Technology stack and prerequisites
 
-Current stack: Python, FastAPI, Uvicorn, PyMuPDF, python-multipart, pytest and httpx.
+Current stack: Python, FastAPI, Uvicorn, PyMuPDF, python-multipart, built-in sqlite3,
+pytest and httpx. SQLite requires no additional package.
 PyMuPDF opens PDFs and extracts text; python-multipart parses upload form data.
 All direct dependencies and their versions are listed in `backend/requirements.txt`.
 Install Python 3.11 or newer and Git. Commands below use Windows PowerShell.
@@ -51,7 +53,8 @@ py -3.11 -m venv backend\.venv
 
 Use an installed newer Python version in place of `-3.11` if needed.
 Calling the virtual environment's Python directly requires no activation.
-No environment variables are required; `.env.example` documents this.
+Paths have defaults; optional overrides are documented in `.env.example`.
+The application does not automatically load `.env` files.
 
 ## Run
 
@@ -108,14 +111,73 @@ encrypted or textless PDFs and multiple files; HTTP 413 for oversized files;
 HTTP 422 for a missing file; HTTP 500 for processing or storage failures.
 Files created during failed processing are removed.
 
+## SQLite document management
+
+On startup, the application creates the database directory and `documents` table
+if needed and recovers interrupted staged deletions. Importing modules creates no
+database files. An explicit `initialize_database(path)` function supports tooling;
+request stores also initialize lazily for clients that do not run the lifespan.
+Each connection enables foreign keys, commits or rolls back its transaction,
+and closes when finished. SQL values use parameterized queries.
+
+The table stores `id` (UUID primary key), `original_filename`, `stored_filename`
+(unique UUID filename), `file_size_bytes`, `total_pages`, `total_characters`, and
+`created_at` (UTC). Required fields and nonnegative integer counts are constrained.
+PDF bytes and extracted page text are not stored in SQLite. Upload responses remain
+unchanged; metadata insertion failure removes the newly created PDF.
+
+Default locations are `backend/data/recalliq.sqlite3` and `backend/uploads/`.
+Relative overrides are resolved against `backend/`, regardless of the shell directory.
+To override paths in PowerShell before starting the backend:
+
+```powershell
+$env:RECALLIQ_DATABASE_PATH = "data/custom.sqlite3"
+$env:RECALLIQ_UPLOADS_DIRECTORY = "uploads"
+```
+
+Absolute paths are also supported. Keep the database and its uploads directory
+together when backing up or changing configuration. Tests override both paths
+independently and use isolated temporary databases and files.
+
+| Endpoint | Behavior |
+| --- | --- |
+| `POST /documents/upload` | Validate, store, extract, persist metadata; HTTP 201 |
+| `GET /documents` | Metadata list, newest first; UUID descending breaks timestamp ties |
+| `GET /documents/{document_id}` | Metadata only; HTTP 404 if unknown, 422 for invalid UUID |
+| `DELETE /documents/{document_id}` | Remove metadata and file; HTTP 204, 404 if unknown |
+
+Metadata responses include `id`, `original_filename`, `file_size_bytes`,
+`total_pages`, `total_characters`, and `created_at`; storage paths, stored filenames
+and extracted text are excluded. Test all endpoints in Swagger, or use PowerShell:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/documents
+Invoke-RestMethod "http://127.0.0.1:8000/documents/<document-id>"
+Invoke-RestMethod -Method Delete "http://127.0.0.1:8000/documents/<document-id>"
+```
+
+Deletion holds an SQLite write transaction, verifies the stored UUID filename stays
+inside the uploads directory and rejects symlinks. It renames the PDF to
+`<uuid>.pdf.deleting`, deletes the metadata and commits, then removes the staged file.
+A missing original file is treated as already removed; metadata deletion still returns
+204. A rename or database failure rolls back and restores the original file. If final
+file removal fails, HTTP 500 reports failure: metadata is already removed and the staged
+file remains for startup recovery. Recovery restores staged files with existing records
+and removes staged files whose records were deleted. Recovery failures stop startup
+rather than silently abandoning data; fix file permissions/locks and restart.
+
 ## Known limitations
 
 - PDFs are stored locally **without encryption**. Processing makes no cloud requests.
 - Image-only/scanned PDFs need OCR, which is not supported. In mixed PDFs, only
   embedded text is extracted; scanned pages may have empty text.
 - Text layout and reading order depend on the PDF. No semantic processing is done.
-- Full extracted text is returned temporarily for development. There is no database,
-  indexing, retrieval, deduplication, document listing or deletion endpoint yet.
+- Full extracted text is returned temporarily by upload for development. Metadata
+  endpoints do not return it. There is no indexing, retrieval or deduplication yet.
+- SQLite and filesystem changes cannot be fully atomic. Staged deletion handles normal
+  rollback and restart recovery; a process crash during upload can leave an unindexed
+  file. Existing PDFs from before SQLite support are not automatically imported.
+- There is no migration framework, pagination or concurrent backup mechanism yet.
 - The limit is enforced while copying from FastAPI's spooled upload in 64 KiB chunks.
   Multipart parsing happens first; this is not an incoming request-body quota.
 - There are no page-count or extracted-output limits yet; keep this development
@@ -144,6 +206,8 @@ is redirected to pytest temporary directories; real uploads are never used.
 - `backend/app/uploads.py`: bounded copying, UUID storage and failure cleanup.
 - `backend/app/pdf_extraction.py`: local PDF validation and text extraction.
 - `backend/app/schemas.py`: Pydantic response models.
+- `backend/app/database.py`: SQLite schema, connections and metadata persistence.
+- `backend/app/document_management.py`: safe staged deletion and restart recovery.
 - `backend/tests/`: health, documentation and PDF tests using FastAPI's TestClient.
 - `backend/requirements.txt`: direct dependencies with pinned versions;
   pip also installs their required dependencies.
@@ -152,5 +216,6 @@ is redirected to pytest temporary directories; real uploads are never used.
 
 `def` defines a function, and indentation defines its body. `dict[str, str]`
 is a return type hint, similar to a TypeScript string-to-string record.
-These routes use ordinary functions because they do no asynchronous I/O.
+Simple routes use ordinary functions; upload is asynchronous and delegates blocking
+file/PDF/database work to a worker thread.
 Uvicorn loads `app.main:app`: the `app` object from the `app.main` module.
