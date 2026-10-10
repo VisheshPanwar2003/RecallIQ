@@ -1,20 +1,21 @@
 # RecallIQ
 
 Privacy-Aware Intelligent Knowledge Assistant. A local-first application with
-a FastAPI backend and local PDF upload and text extraction.
+a FastAPI backend, PDF document management and local semantic retrieval.
 
 ## Development status and current features
 
-The backend foundation, PDF extraction and SQLite document management are implemented:
+The backend foundation, PDF extraction, SQLite management and semantic search are implemented:
 
 - `GET /` and `GET /health`, Swagger UI and an OpenAPI schema.
 - `POST /documents/upload` accepts one PDF up to 20 MiB (20 × 1024 × 1024 bytes).
 - Case-insensitive extension, signature, PDF structure and encryption checks.
 - Local UUID-based file storage and per-page text extraction with character counts.
 - SQLite metadata persistence, document listing, details and recoverable deletion.
+- Page-aware overlapping chunks, local Sentence Transformer embeddings and persistent ChromaDB search.
 - Automated tests using generated PDFs and isolated temporary directories.
 
-There is no authentication, encryption of stored uploads or AI integration.
+There is no authentication, encryption, LLM answer generation, RAG or agent integration.
 
 ## Planned features (not implemented)
 
@@ -28,7 +29,7 @@ There is no authentication, encryption of stored uploads or AI integration.
 ## Technology stack and prerequisites
 
 Current stack: Python, FastAPI, Uvicorn, PyMuPDF, python-multipart, built-in sqlite3,
-pytest and httpx. SQLite requires no additional package.
+Sentence Transformers, ChromaDB, pytest and httpx. SQLite requires no additional package.
 PyMuPDF opens PDFs and extracts text; python-multipart parses upload form data.
 All direct dependencies and their versions are listed in `backend/requirements.txt`.
 Install Python 3.11 or newer and Git. Commands below use Windows PowerShell.
@@ -166,14 +167,150 @@ file remains for startup recovery. Recovery restores staged files with existing 
 and removes staged files whose records were deleted. Recovery failures stop startup
 rather than silently abandoning data; fix file permissions/locks and restart.
 
+## Local semantic search
+
+Upload stores the PDF and metadata; indexing is an explicit separate action.
+`POST /documents/{document_id}/index` safely reopens the stored PDF with PyMuPDF.
+The chunker splits each page independently into up to 800 characters, with a target
+120-character overlap, preferring paragraph, sentence and word boundaries. Blank
+pages produce no chunks. UUID5 chunk identifiers are deterministic for the document,
+page, offsets and text; chunk order starts at zero, page numbers at one.
+
+Sentence Transformers runs `sentence-transformers/all-MiniLM-L6-v2` locally on CPU,
+using normalized float32, 384-dimensional embeddings and batches of 32. Model weights
+are pinned to revision `1110a243fdf4706b3f48f1d95db1a4f5529b4d41`; the same settings
+are used for documents and queries. No model is loaded during startup, upload, CRUD,
+or an empty search. First indexing may download weights from Hugging Face; document
+text is never sent there. Later requests reuse the model in-process and its disk cache.
+Model failures return HTTP 503 with a client-safe explanation.
+
+ChromaDB uses local persistent storage, explicit embeddings and cosine distance;
+its default embedding function and usage telemetry are disabled. Configuration is
+recorded in Chroma collection metadata and SQLite index manifests. A mismatched model
+configuration is rejected rather than mixing incompatible vector spaces.
+Optional PowerShell settings (paths relative to `backend/`):
+
+```powershell
+$env:RECALLIQ_VECTOR_DIRECTORY = "indexes/chroma"
+$env:RECALLIQ_MODEL_CACHE = "data/models"
+$env:RECALLIQ_CHUNK_SIZE = "800"
+$env:RECALLIQ_CHUNK_OVERLAP = "120"
+# Use after the pinned model has been downloaded:
+$env:RECALLIQ_MODELS_OFFLINE = "1"
+```
+
+`RECALLIQ_CHUNK_SIZE` must be positive; overlap must be nonnegative and smaller.
+Omit offline mode for the one-time model download. Cache and vector directories are
+Git-ignored. No cloud embedding API, LLM or generated answer is involved.
+
+In Swagger, upload a PDF, copy its UUID, call its `/index` endpoint, then call
+`POST /search/semantic`. Equivalent PowerShell commands:
+
+```powershell
+$documentId = "<UUID returned by upload>"
+Invoke-RestMethod -Method Post "http://127.0.0.1:8000/documents/$documentId/index"
+$searchBody = @{
+    query = "What methodology was used in the research?"
+    top_k = 5
+    document_ids = @($documentId)
+} | ConvertTo-Json
+Invoke-RestMethod -Method Post "http://127.0.0.1:8000/search/semantic" `
+    -ContentType "application/json" -Body $searchBody
+```
+
+Indexing returns `document_id`, `pages_processed`, `chunks_indexed` and `status`
+(`indexed`). Missing documents return 404, malformed UUIDs 422, missing PDF files
+409, invalid PDFs 400, model/configuration failures 503, and other indexing failures 500.
+Search accepts a nonblank query of at most 2000 characters and integer `top_k` from
+1 to 20. Optional `document_ids` accepts at most 100 UUIDs; empty or omitted means
+all indexed documents. Unknown filters and empty indexes return `{"results": []}`.
+Matches contain `document_id`, `filename`, `chunk_id`, `page_number`, `chunk_text`
+and `distance`, ranked by ascending cosine distance (`1 - cosine similarity`):
+lower is more similar, approximately 0 for identical normalized embeddings. Scores
+are not confidence probabilities or evidence of correctness. Citations are metadata
+from stored chunks; there is no conversational answer generation.
+
+## Indexing and deletion consistency
+
+SQLite `document_indexes` records the active content/configuration generation;
+`vector_cleanup` is a durable queue of deleted document UUIDs. Chroma upserts
+deterministic generation/chunk IDs before SQLite activates the generation. Partial
+new generations remain hidden; reindexing retries the same IDs. A failed changed-content
+reindex preserves the previous active generation. Success removes old/partial generations.
+A cleanup failure after activation can return 500 even though the new generation is
+complete; retrying indexing finishes cleanup without duplicating chunks.
+Reindexing unchanged content verifies chunk count, reuses a complete generation and
+retries cleanup; missing vector data can be reconstructed by reindexing.
+
+Deletion preserves the staged-file transaction and queues vector removal in the same
+SQLite transaction. It then removes document vectors. If vector cleanup fails, the API
+returns 500 and leaves the queue entry. The next indexing, search or deletion request
+retries queued removals without needing to load an embedding model. Startup recovers
+PDF deletion; vector cleanup stays lazy. Searches filter against live SQLite metadata
+and active generations before and after querying, so deleted/partial chunks never
+become eligible results even while physical vector cleanup is pending.
+
+These operations are not one atomic transaction across all three stores. Use a single
+Uvicorn process: a process-local lock serializes indexing/search/deletion. Concurrent
+multi-process writers are not supported. Crash-abandoned inactive generations may occupy
+disk until safe reindexing or document deletion removes them. Back up SQLite, uploads
+and Chroma together, and keep configuration stable between restarts.
+
+## Optional real-model verification
+
+Normal tests use deterministic fake embeddings with real, temporary persistent ChromaDB.
+They need no model download or network. To manually verify the real model:
+
+1. Install requirements and run the backend using the commands above.
+2. Upload two non-sensitive text PDFs: one about fruit and one about spacecraft.
+3. Index both through Swagger; allow the one-time download on the first request.
+4. Search for a paraphrase about fruit and check its source filename, page and text.
+5. Filter to the spacecraft UUID and verify no fruit-document result is returned.
+6. Stop/restart with `RECALLIQ_MODELS_OFFLINE=1`; search again without reindexing.
+7. Delete one document and verify it disappears from both listing and search.
+
+This procedure is optional and is separate from the fake-embedding test results.
+
+Real-model verification completed on 2026-10-10 using the actual pinned model,
+API handlers through TestClient and isolated persistent ChromaDB. A generated
+two-page `solar_rover_sample.pdf` placed garden text on page 1 and a solar-powered
+Mars rover on page 2. The paraphrased query "How does the vehicle exploring the red
+planet get power?" ranked the page-2 photovoltaic-panel passage first (cosine
+distance about 0.494), with the correct document UUID and filename. Reindexing kept
+two chunks; deletion returned 204 and left zero vectors and no search results.
+No generated verification artifacts or model weights are tracked in Git.
+
+The real tokenizer also confirmed that character size does not guarantee token size:
+
+| 800-character sample | Tokens including special tokens | After the 256-token limit |
+| --- | --- | --- |
+| Repeated ordinary English sentence about solar panels | 119 | 119 |
+| Repeated `qzxv_9137_jkmb_4826` identifiers | 562 | 256 |
+
+For these measurements each repeated string was sliced to exactly 800 characters.
+The actual encoder handled the longer sample by truncating it and returning a
+384-dimensional embedding. Words beyond that prefix do not influence its embedding,
+even though search returns the full chunk text. Identifier-heavy, technical or
+non-English chunks can therefore lose retrieval relevance for facts near their end.
+The 120-character overlap does not guarantee coverage of every truncated token.
+Token-aware splitting is not implemented; smaller character chunks can reduce but
+cannot guarantee elimination of this limitation.
+
 ## Known limitations
 
-- PDFs are stored locally **without encryption**. Processing makes no cloud requests.
+- PDFs, SQLite metadata, chunk text, embeddings and vector indexes are stored locally
+  **without encryption**. Only optional model-weight downloads use the network;
+  extraction, embedding inference and vector search are local. Derived text/vector data
+  will need protection alongside PDFs in the future encrypted vault.
 - Image-only/scanned PDFs need OCR, which is not supported. In mixed PDFs, only
   embedded text is extracted; scanned pages may have empty text.
-- Text layout and reading order depend on the PDF. No semantic processing is done.
+- Text layout and reading order depend on the PDF; extraction does not reconstruct
+  document structure or verify the accuracy of retrieved text.
 - Full extracted text is returned temporarily by upload for development. Metadata
-  endpoints do not return it. There is no indexing, retrieval or deduplication yet.
+  endpoints do not return it. Search returns matching chunk text; there is no LLM
+  generation, keyword/hybrid retrieval or upload deduplication yet.
+- Character-based chunks may exceed the model's 256-token window and be truncated,
+  especially for non-English text. Retrieval is approximate and has no relevance cutoff.
 - SQLite and filesystem changes cannot be fully atomic. Staged deletion handles normal
   rollback and restart recovery; a process crash during upload can leave an unindexed
   file. Existing PDFs from before SQLite support are not automatically imported.
@@ -208,6 +345,11 @@ is redirected to pytest temporary directories; real uploads are never used.
 - `backend/app/schemas.py`: Pydantic response models.
 - `backend/app/database.py`: SQLite schema, connections and metadata persistence.
 - `backend/app/document_management.py`: safe staged deletion and restart recovery.
+- `backend/app/chunking.py`: deterministic page-aware text splitting.
+- `backend/app/embeddings.py`: lazy local model loading and batched embeddings.
+- `backend/app/vectors.py`: persistent Chroma storage and retrieval.
+- `backend/app/semantic.py`: indexing manifests, filtering and cleanup recovery.
+- `backend/app/search.py`: validated semantic retrieval endpoint.
 - `backend/tests/`: health, documentation and PDF tests using FastAPI's TestClient.
 - `backend/requirements.txt`: direct dependencies with pinned versions;
   pip also installs their required dependencies.

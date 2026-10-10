@@ -45,6 +45,9 @@ def delete_document(store: DocumentStore, directory: Path, document_id: str) -> 
                 # A missing source file is an already-completed filesystem deletion.
                 pass
             connection.execute("DELETE FROM documents WHERE id = ?", (document_id,))
+            connection.execute(
+                "INSERT OR IGNORE INTO vector_cleanup (document_id) VALUES (?)", (document_id,)
+            )
             connection.commit()
         except Exception:
             # Restore before rollback releases the lock to another delete/recovery.

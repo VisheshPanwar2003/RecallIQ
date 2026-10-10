@@ -6,9 +6,13 @@ from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, 
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
-from app.schemas import DocumentMetadata, DocumentUploadResponse
+from app.schemas import DocumentMetadata, DocumentUploadResponse, IndexingResponse
 from app.database import DocumentStore, get_document_store
-from app.document_management import DocumentNotFound, delete_document
+from app.document_management import DocumentNotFound
+from app.embeddings import LocalEmbedder, ModelUnavailable, get_embedder
+from app.vectors import VectorIndex, IndexUnavailable, get_vector_index
+from app.semantic import delete_indexed_document, index_document
+from app.pdf_extraction import InvalidPDF
 from app.uploads import UploadRejected, get_uploads_directory, store_and_extract
 
 
@@ -63,11 +67,35 @@ def remove_document(
     document_id: UUID,
     store: Annotated[DocumentStore, Depends(get_document_store)],
     directory: Annotated[Path, Depends(get_uploads_directory)],
+    vectors: Annotated[VectorIndex, Depends(get_vector_index)],
+    embedder: Annotated[LocalEmbedder, Depends(get_embedder)],
 ):
     try:
-        delete_document(store, directory, str(document_id))
+        delete_indexed_document(store, directory, vectors, embedder, str(document_id))
     except DocumentNotFound as error:
         raise HTTPException(404, "Document not found.") from error
     except Exception as error:
         raise HTTPException(500, "Document deletion failed. Recovery may be required.") from error
     return Response(status_code=204)
+
+
+@router.post("/{document_id}/index", response_model=IndexingResponse)
+def index_stored_document(
+    document_id: UUID,
+    store: Annotated[DocumentStore, Depends(get_document_store)],
+    directory: Annotated[Path, Depends(get_uploads_directory)],
+    vectors: Annotated[VectorIndex, Depends(get_vector_index)],
+    embedder: Annotated[LocalEmbedder, Depends(get_embedder)],
+):
+    try:
+        return index_document(store, directory, vectors, embedder, str(document_id))
+    except DocumentNotFound as error:
+        raise HTTPException(404, "Document not found.") from error
+    except FileNotFoundError as error:
+        raise HTTPException(409, "Stored PDF is missing. Re-upload the document.") from error
+    except InvalidPDF as error:
+        raise HTTPException(400, str(error)) from error
+    except (ModelUnavailable, IndexUnavailable) as error:
+        raise HTTPException(503, str(error)) from error
+    except Exception as error:
+        raise HTTPException(500, "Document indexing failed. Safe reindexing can be retried.") from error
