@@ -271,6 +271,31 @@ They need no model download or network. To manually verify the real model:
 
 This procedure is optional and is separate from the fake-embedding test results.
 
+Real-model verification completed on 2026-10-10 using the actual pinned model,
+API handlers through TestClient and isolated persistent ChromaDB. A generated
+two-page `solar_rover_sample.pdf` placed garden text on page 1 and a solar-powered
+Mars rover on page 2. The paraphrased query "How does the vehicle exploring the red
+planet get power?" ranked the page-2 photovoltaic-panel passage first (cosine
+distance about 0.494), with the correct document UUID and filename. Reindexing kept
+two chunks; deletion returned 204 and left zero vectors and no search results.
+No generated verification artifacts or model weights are tracked in Git.
+
+The real tokenizer also confirmed that character size does not guarantee token size:
+
+| 800-character sample | Tokens including special tokens | After the 256-token limit |
+| --- | --- | --- |
+| Repeated ordinary English sentence about solar panels | 119 | 119 |
+| Repeated `qzxv_9137_jkmb_4826` identifiers | 562 | 256 |
+
+For these measurements each repeated string was sliced to exactly 800 characters.
+The actual encoder handled the longer sample by truncating it and returning a
+384-dimensional embedding. Words beyond that prefix do not influence its embedding,
+even though search returns the full chunk text. Identifier-heavy, technical or
+non-English chunks can therefore lose retrieval relevance for facts near their end.
+The 120-character overlap does not guarantee coverage of every truncated token.
+Token-aware splitting is not implemented; smaller character chunks can reduce but
+cannot guarantee elimination of this limitation.
+
 ## Known limitations
 
 - PDFs, SQLite metadata, chunk text, embeddings and vector indexes are stored locally
