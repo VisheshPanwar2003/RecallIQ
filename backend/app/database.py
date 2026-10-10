@@ -43,6 +43,18 @@ def initialize_database(path: Path) -> None:
                 created_at TEXT NOT NULL CHECK(length(created_at) > 0)
             )
         """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS document_indexes (
+                document_id TEXT PRIMARY KEY NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                generation TEXT NOT NULL CHECK(length(generation) = 64),
+                embedding_config TEXT NOT NULL CHECK(length(embedding_config) > 0)
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS vector_cleanup (
+                document_id TEXT PRIMARY KEY NOT NULL
+            )
+        """)
 
 
 class DocumentStore:

@@ -23,6 +23,8 @@ htmlcov/
 *.sqlite3-*
 uploads/
 indexes/
+models/
+.cache/
 data/
 vault/
 logs/
