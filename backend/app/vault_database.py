@@ -6,7 +6,6 @@ from pathlib import Path
 
 from app.database import DocumentStore, initialize_schema
 from app.storage import validate_path
-from app.vault_keys import VaultState
 
 
 class VaultDatabaseUnavailable(RuntimeError):
@@ -76,7 +75,7 @@ class VaultDocumentStore(DocumentStore):
                 raise VaultDatabaseUnavailable() from None
 
     def _check(self):
-        if self._closed or self.owner.state != VaultState.UNLOCKED:
+        if self._closed or not self.owner._available():
             raise VaultDatabaseUnavailable()
         root = validate_path(self.owner._root)
         if root.drive.startswith("\\\\"):
@@ -140,13 +139,20 @@ class VaultDocumentStore(DocumentStore):
         connection.execute("INSERT INTO vault_schema_migrations VALUES (2)")
 
     def _validate_schema(self, connection):
-        if [row[0] for row in connection.execute("SELECT version FROM vault_schema_migrations ORDER BY version")] != [1, 2]:
+        versions = [row[0] for row in connection.execute("SELECT version FROM vault_schema_migrations ORDER BY version")]
+        if versions not in ([1, 2], [1, 2, 3]):
             raise VaultDatabaseUnavailable()
         info = connection.execute("SELECT vault_id,embedding_config FROM vault_info WHERE id=1").fetchone()
         if not info or info[0] != self.owner._vault_id or info[1] != self.config_json:
             raise VaultDatabaseUnavailable()
         if [row[0] for row in connection.execute("SELECT version FROM schema_migrations ORDER BY version")] != [1]:
             raise VaultDatabaseUnavailable()
+
+    def _managed(self, document_id):
+        with self.connection() as connection:
+            if not connection.execute("SELECT 1 FROM sqlite_master WHERE name='vault_document_files'").fetchone():
+                return False
+            return connection.execute("SELECT 1 FROM vault_document_files WHERE document_id=?", (document_id,)).fetchone() is not None
 
     def close(self):
         with self.owner._mutex:

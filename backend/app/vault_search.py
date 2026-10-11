@@ -1,6 +1,7 @@
 """Internal synthetic-page indexing and existing retrieval over encrypted rows."""
 import hashlib
 import json
+from contextlib import contextmanager
 from uuid import UUID
 
 import numpy as np
@@ -11,6 +12,18 @@ from app.semantic import search_documents, semantic_lock
 from app.hybrid import search_hybrid
 from app.vectors import IndexUnavailable
 from app.vault_database import VaultDatabaseUnavailable
+from app.vault_keys import VaultError
+from app.vault_memory import operation_reservation
+
+
+@contextmanager
+def _store_operation(store):
+    """Preserve the existing encrypted-search error contract on key revocation."""
+    try:
+        with operation_reservation(store.owner):
+            yield
+    except VaultError:
+        raise VaultDatabaseUnavailable() from None
 
 
 MAX_CHUNKS = 10_000
@@ -137,11 +150,11 @@ class VaultSearchService:
         self.store = store
         self.embedder = embedder
         self.vectors = NumpyVectorIndex(store)
-        with store.owner._mutex:
+        with _store_operation(store), store.owner._mutex:
             self.vectors._load(embedder.config)
 
     def index_pages(self, document_id, pages):
-        with semantic_lock, self.store.owner._mutex:
+        with _store_operation(self.store), semantic_lock, self.store.owner._mutex:
             self.store._check()
             if self.store.get(document_id) is None:
                 raise VaultDatabaseUnavailable()
@@ -185,7 +198,7 @@ class VaultSearchService:
             return {"document_id": document_id, "pages_processed": len(pages), "chunks_indexed": len(chunks), "status": "indexed"}
 
     def search(self, request, mode="semantic"):
-        with semantic_lock, self.store.owner._mutex:
+        with _store_operation(self.store), semantic_lock, self.store.owner._mutex:
             self.store._check()
             # Validate even keyword-only and empty searches; no partial fallback.
             self.vectors._load(self.embedder.config)
@@ -198,7 +211,9 @@ class VaultSearchService:
             raise ValueError("Unsupported retrieval mode.")
 
     def delete(self, document_id):
-        with semantic_lock, self.store.owner._mutex:
+        with _store_operation(self.store), semantic_lock, self.store.owner._mutex:
+            if self.store._managed(document_id):
+                raise VaultDatabaseUnavailable()
             self.store._snapshot = None
             with self.store.connection() as connection:
                 if not connection.execute("SELECT 1 FROM documents WHERE id=?", (document_id,)).fetchone():

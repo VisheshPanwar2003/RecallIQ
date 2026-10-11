@@ -17,16 +17,17 @@ The backend foundation, PDF extraction, SQLite management and all three retrieva
 - Automated tests using generated PDFs and isolated temporary directories.
 - Centralized private-storage configuration, early locked-vault guards and readiness status.
 - Internal password-protected key envelopes, SQLCipher storage and in-memory NumPy retrieval.
+- Internal authenticated encrypted PDF ingestion, in-memory extraction and recoverable deletion.
 
 Public document/search endpoints remain unencrypted development functionality.
-The built-in vault foundation is internal-only; encrypted PDF ingestion and general
+The built-in vault services are internal-only; public vault uploads and general
 vault HTTP access are blocked. There is no HTTP authentication, LLM answer generation,
 RAG or agent integration.
 
 ## Planned features (not implemented)
 
 - Broader document ingestion and knowledge management.
-- Complete encrypted vault ingestion, lifecycle isolation and explicit data migration.
+- Vault HTTP integration, isolated worker lifecycle and explicit data migration.
 - System 1/System 2 routing and local LLM support through Ollama.
 - Agentic RAG through LangGraph.
 - Privacy guardrails and explicit consent for optional cloud requests.
@@ -633,9 +634,152 @@ partial failures, retries, persistence and deletion. Normal tests need no intern
 
 ## Files and concepts
 
+### Internal encrypted PDF lifecycle (Task 10)
+
+`VaultDocumentService(store, search)` adds an internal document lifecycle to an
+explicitly initialized, unlocked `VaultKeyManager` and existing SQLCipher store.
+It never opens development SQLite or Chroma, migrates user data, or provides an
+HTTP password/upload endpoint. `ingest(stream, filename)` accepts a trusted,
+bounded binary stream; `decrypt(id)` returns authenticated PDF bytes in memory;
+`extract(id)` extracts page text in memory; `index(id)` uses the existing encrypted
+database and NumPy retrieval; `delete(id)` and `recover()` coordinate cleanup.
+Construct new stores/services after re-unlocking; old stores remain closed.
+
+Data flows from a bounded stream to RAM, then MuPDF validation/extraction, then
+AES-GCM ciphertext staging and encrypted SQLCipher pending records. The original
+PDF is never written as plaintext by these services. Metadata and extracted page
+text persist only inside SQLCipher; embeddings remain encrypted in SQLCipher and
+are loaded into NumPy in memory. Public development uploads still write plaintext
+PDFs and may spill multipart data to disk. The existing guard rejects vault-mode
+document/search requests before receiving their bodies or invoking multipart
+parsing. **Internal stream tests are not tests of a supported vault HTTP parser.**
+
+#### Format and limits
+
+Encrypted PDF format v1 uses a fixed 61-byte big-endian header: 8-byte
+`RIQPDF` magic (two trailing zero bytes), version byte, 16-byte vault UUID,
+16-byte document UUID, random 12-byte nonce and 8-byte plaintext length. The entire
+header is AES-256-GCM associated data. Ciphertext includes a 16-byte authentication
+tag; exact total length is checked, rejecting trailing/truncated bytes and unknown
+versions. Vault/document substitution, altered metadata, wrong keys and ciphertext
+tampering fail before plaintext is returned. The key is the existing HKDF document
+subkey; AES-GCM uses the established `cryptography` implementation.
+
+A permanent SQLCipher nonce/UUID ledger reserves each nonce **before encryption**.
+Collisions fail; reservations survive failure and deletion so retries cannot reuse
+an ID or nonce. There is no password or key in recovery records. Header IDs, nonce,
+length and ciphertext hash are non-secret. Original filenames are SQLCipher
+metadata and never construct filesystem paths. Physical files are exclusively
+created as `staging/<UUID>.rpdf.pending`, fsynced, then published as
+`documents/<UUID>.rpdf` using a no-overwrite hard link on supported local filesystems.
+The shared `stored_filename` database field remains a logical `<UUID>.pdf` identifier;
+it is never used to open a plaintext file in this service.
+
+Limits are deliberately fixed in code for this MVP:
+
+| Resource | Limit |
+| --- | --- |
+| Original PDF | 20 MiB |
+| Encrypted container | 20 MiB + 77 bytes |
+| Extracted pages | 200 |
+| Extracted UTF-8 text per page / PDF | 256 KiB / 4 MiB |
+| Original filename | 255 UTF-8 bytes; no path separators or NUL |
+| Heavy vault operations | One per process; competing work fails promptly |
+| Managed-buffer reservation | 256 MiB per admitted operation |
+| Stream deadline | 30 seconds by default; maximum 300 seconds |
+
+The reservation accounts for input/bytearray copies, ciphertext/decryption buffers,
+page strings, SQL rows and NumPy matrix copies. It is **not a hard process RSS cap**:
+MuPDF may allocate before output limits are checked, model residency and Python
+overhead add memory, and native calls cannot be interrupted safely in this process.
+Cancellation and deadlines are cooperative between stream reads and after
+extraction; trusted streams must implement their own blocking-read deadlines.
+After the `PREPARING` journal is committed, the durable publication/cleanup phase
+finishes rather than honoring the cooperative cancel flag; interruptions leave
+registered state for recovery. Exception/debugger references and plaintext returned
+to trusted callers may outlive a reservation and cannot be reliably erased.
+Do not expose this synchronous interface directly to untrusted HTTP clients.
+Future HTTP integration needs pre-parser and streaming body caps, robust disconnect/
+timeout/cancellation handling, an in-memory/encrypted multipart parser, and worker
+isolation. Missing/incorrect Content-Length and malformed multipart requests currently
+receive the locked 503 response without body parsing; they are not accepted uploads.
+
+#### Ingestion and deletion recovery
+
+Schema version 3 is an additive transaction inside the encrypted database only.
+It adds a nonce/ID ledger, non-sensitive operation records, separate pending
+metadata/pages, committed encrypted page records and a ciphertext manifest.
+Pending documents cannot appear in normal document listings or any search mode.
+
+| Ingestion state | Recovery behavior |
+| --- | --- |
+| `PREPARING` | Reserved ID/nonce, then encrypted pending metadata; no public document. Missing staged/final files abort to `FAILED`. |
+| `FILE_STAGED` | Authenticate staged ciphertext, publish exclusively, then complete the transaction. |
+| `FILE_PUBLISHED` | Authenticate the final file and commit document metadata/pages/manifest together. |
+| `COMMITTED` | Visible document with authenticated file; remove any recorded staging hard link. `stage_owned=1` signals outstanding cleanup. |
+| `FAILED` | Aborted ingestion; no visible document. ID/nonce reservation remains. |
+
+Recovery handles crashes before/after publication and database commit, including
+publication completed before its state update. A partial exclusively owned staging
+file is removed only if its available header prefix matches the registered identity,
+nonce and length (or it is empty). Modified, substituted, unowned or otherwise
+ambiguous files are preserved and recovery fails observably. A crash in the narrow
+exclusive-create/ownership-record gap requires explicit inspection rather than
+guessing ownership. Recovery scans registered operations in bounded batches, never
+arbitrary directory contents. Repetition does not duplicate records or overwrite
+committed ciphertext. Missing/tampered committed files fail closed; they are not
+silently recreated. Run `recover()` explicitly when reopening before resuming work.
+
+Deletion atomically changes the operation to `DELETE_PENDING` and removes document
+visibility, page text, chunks, FTS rows, manifests and embeddings through foreign-key
+cascades. It invalidates the NumPy snapshot. Only then does it authenticate/hash-check
+and unlink the registered ciphertext. Failure leaves a durable tombstone for retry;
+recovery cannot resurrect a deleted document. Completed cleanup is `DELETED`.
+Repeated deletion/recovery is safe and unrelated documents remain untouched.
+Direct search-service deletion rejects documents managed by this lifecycle.
+This is logical deletion and file unlinking, **not secure erasure** of SSDs/backups.
+
+#### Locking and remaining boundaries
+
+Key-owner leases cover accepted operations while expensive PDF work releases the
+owner mutex. Lock/unlock closes admission immediately, waits for leases to finish,
+closes registered stores and drops NumPy snapshots and key references. New requests
+cannot wait behind a busy database mutex and then enter during locking. Nested
+leases are restricted to the owning thread. Global admission prevents concurrent
+heavy ingest/index/delete work; SQL transactions and the established search lock
+coordinate short visibility changes. No new operation is accepted while locking.
+
+Existing path validation rejects traversal, symlinks and Windows junction/reparse
+escapes before access. This does not defeat a privileged local attacker racing
+filesystem changes. Hard-link publication depends on local filesystem support;
+Windows ACL inheritance, directory fsync/power-loss durability, paging, crash dumps,
+hibernation and native-library artifacts remain unresolved. There is no dedicated
+storage worker, multiprocess coordination, guaranteed key/RAM erasure, plaintext
+data migration, secure vault dismount or public authenticated vault HTTP boundary.
+RecallIQ is **not claimed production-secure or fully encrypted**.
+
+Task 10 tests use generated PDFs and disposable real SQLCipher vaults, including
+20 MiB input, no-spool assertions above 1 MiB, authenticated-format failures,
+transition crashes, cleanup failures, citations, all retrieval modes, locking,
+concurrency admission and actual Windows junction rejection. No new dependency is
+required. Run the complete suite with the existing `python -m pytest` command.
+Final Task 10 validation: **346 passed, 0 failed, 0 skipped**, including 81 new
+document-lifecycle/security cases; one existing TestClient deprecation warning.
+An additional offline check used the actual pinned MiniLM model with a generated
+two-page PDF: ingestion/decryption, original filename/page citations, idempotent
+indexing and deletion succeeded across semantic, keyword and hybrid retrieval.
+On this Windows machine, ingestion took about 593 ms, first indexing (including
+model loading) 43 seconds, queries 156–358 ms, and deletion 241 ms. The process
+working set was about 91 MiB before loading the model and 466 MiB afterward.
+These are small-sample observations collected alongside regression tests, not
+benchmarks or maximum-memory guarantees; model residency is outside the managed
+document-buffer reservation.
+Cryptographic references: [AES-GCM](https://cryptography.io/en/latest/hazmat/primitives/aead/)
+and [MuPDF in-memory documents](https://pymupdf.readthedocs.io/en/latest/document.html).
+
 ### Internal encrypted database and retrieval (Task 9)
 
-This milestone integrates the encrypted database through internal services using
+Task 9 integrated the encrypted database through internal services using
 generated/in-memory page data. It **does not activate vault HTTP endpoints**, copy
 existing databases, upload encrypted PDFs or change development storage defaults.
 `RECALLIQ_VAULT_MODE=disabled` retains SQLite and persistent Chroma development
@@ -707,7 +851,7 @@ or cross-process lock protocol. Plaintext Python values already returned to call
 cannot be erased. Paging, dumps, hibernation, native artifacts, inherited Windows
 ACLs, filesystem races and power-loss recovery remain limitations. Model input
 still truncates at 256 tokens. Plaintext multipart spills are unchanged in
-development; vault-mode uploads remain blocked until encrypted ingestion is built.
+development; public vault-mode uploads remain blocked pending HTTP-boundary work.
 
 Tests use real SQLCipher and disposable vaults, exercising wrong keys/corruption,
 ordinary SQLite rejection, FTS/BM25, WAL/journal canary checks, malformed vectors,
