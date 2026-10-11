@@ -36,6 +36,9 @@ temp/
 *.temp
 *.pem
 *.key
+*.pdf
+*.hc
+*.dmp
 .aws/
 .codex/
 

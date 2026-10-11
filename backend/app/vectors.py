@@ -1,8 +1,7 @@
 import json
-import os
 from pathlib import Path
 
-from app.database import BACKEND_DIRECTORY
+from app.storage import get_private_storage, check_private_path
 
 
 class IndexUnavailable(RuntimeError):
@@ -10,8 +9,7 @@ class IndexUnavailable(RuntimeError):
 
 
 def get_vector_directory() -> Path:
-    value = Path(os.environ.get("RECALLIQ_VECTOR_DIRECTORY", "indexes/chroma"))
-    return value if value.is_absolute() else BACKEND_DIRECTORY / value
+    return get_private_storage().vectors
 
 
 class VectorIndex:
@@ -21,6 +19,7 @@ class VectorIndex:
         self.path = path
 
     def collection(self, config, *, create=True):
+        check_private_path(self.path)
         if not create and not self.path.exists():
             return None
         import chromadb

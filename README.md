@@ -15,6 +15,7 @@ The backend foundation, PDF extraction, SQLite management and all three retrieva
 - Page-aware overlapping chunks, local Sentence Transformer embeddings and persistent ChromaDB search.
 - SQLite FTS5 keyword search with BM25 and Reciprocal Rank Fusion (RRF) hybrid search.
 - Automated tests using generated PDFs and isolated temporary directories.
+- Centralized private-storage configuration, early locked-vault guards and readiness status.
 
 There is no authentication, encryption, LLM answer generation, RAG or agent integration.
 
@@ -62,11 +63,14 @@ The application does not automatically load `.env` files.
 
 ```powershell
 Set-Location D:\RecallIQ\backend
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload
+.\.venv\Scripts\python.exe -m app.run --reload
 ```
 
 Open http://127.0.0.1:8000/docs for interactive Swagger UI. Stop the server
 with Ctrl+C. `--reload` restarts it when source files change.
+The launcher configures process temporary storage before importing Uvicorn or the
+application. Direct `uvicorn app.main:app` still runs, but bypasses that early process
+configuration; prefer the launcher for the storage policy described below.
 
 In another PowerShell terminal:
 
@@ -465,6 +469,147 @@ unchanged in both stores) and deletion were verified. Generated artifacts are ig
 - PDFs requiring structural repair are rejected as corrupt rather than repaired.
 - The existing httpx TestClient integration emits a dependency deprecation warning.
 
+## Secure storage boundary and vault guards
+
+This milestone prepares the storage boundary. **It implements no encryption,
+VeraCrypt mounting, passwords, migration, unlocking API or worker orchestration.**
+An ordinary directory is not an encrypted volume. Source PDFs, metadata, FTS terms,
+chunk text and embeddings remain plaintext with the current development setup.
+
+`RECALLIQ_VAULT_MODE` accepts exactly `disabled` or `external`; unset defaults to
+`disabled` for compatibility. Unknown values fail closed for private operations.
+
+| Mode | Behavior |
+| --- | --- |
+| `disabled` | Existing development paths and upload/CRUD/retrieval behavior; no encryption guarantee |
+| `external` | Fixed private paths beneath an existing absolute `RECALLIQ_VAULT_ROOT`; access requires trusted independent verification |
+
+Development configuration remains explicit and supports existing path overrides:
+
+```powershell
+$env:RECALLIQ_VAULT_MODE = "disabled"
+# Optional; relative values resolve against backend/:
+$env:RECALLIQ_TEMP_DIRECTORY = "tmp/private"
+```
+
+The configuration service derives uploads, database, vectors, private temporary
+storage and recovery paths. Existing defaults remain `backend/uploads`,
+`backend/data/recalliq.sqlite3` and `backend/indexes/chroma`; new development defaults
+are `backend/tmp/private` and `backend/data/recovery`. Recovery currently continues
+to use existing `.pdf.deleting` files alongside uploads and SQLite cleanup tables;
+the designated recovery location is available for application-owned artifacts and
+is not created unless needed. No existing data is moved or copied.
+
+External configuration example (it will remain locked in this milestone):
+
+```powershell
+$env:RECALLIQ_VAULT_MODE = "external"
+$env:RECALLIQ_VAULT_ROOT = "V:\RecallIQ"
+# Remove development overrides; external locations cannot be independently overridden.
+foreach ($name in @("RECALLIQ_DATABASE_PATH", "RECALLIQ_UPLOADS_DIRECTORY",
+                    "RECALLIQ_VECTOR_DIRECTORY", "RECALLIQ_TEMP_DIRECTORY",
+                    "RECALLIQ_RECOVERY_DIRECTORY")) {
+    Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+}
+```
+
+External private paths are fixed beneath that root:
+
+```text
+uploads/                     original PDFs and staged deletion files
+database/recalliq.sqlite3     metadata, chunks, FTS, manifests and cleanup queue
+indexes/chroma/              persistent vectors, text, metadata and Chroma files
+temporary/                   application-owned temporary files and upload spools
+recovery/                    designated application-owned recovery artifacts
+```
+
+The root must already exist, be a directory and use an absolute local path. It is
+never created for an unavailable vault. Directory existence, a drive letter, a
+marker file or an environment flag cannot establish verification. The internal
+`VaultVerifier` protocol is the seam for a later VeraCrypt integration that checks
+the actual mounted volume, identity and current state. Its production implementation
+currently always declines verification, so **external mode remains locked even if
+you manually mount a volume**. Tests inject a trusted test-only verifier; that fixture
+does not demonstrate encryption or provide a user unlock mechanism.
+
+External mode rejects conflicting development path variables, network/UNC roots,
+traversal and existing symlinks or Windows reparse points/junctions. Paths are checked
+before resolution, and external private trees are inspected without following links.
+SQLite companion names and nested Chroma paths are included. The drive mount itself
+must be checked by the future verifier. Development overrides also reject traversal
+and links on directly accessed paths; development mode is not a confined vault.
+No invalid external configuration falls back to the old plaintext locations.
+
+### Locked request behavior and readiness
+
+A pure ASGI middleware guards `/documents`, `/search` and their subpaths before
+calling the request receiver, multipart parser or FastAPI dependencies. Locked or
+invalid storage returns HTTP 503 with a safe response such as:
+
+```json
+{
+  "detail": "Private storage is unavailable or the external vault is not verified.",
+  "code": "vault_locked"
+}
+```
+
+Invalid development/configuration states use `storage_unavailable`. Locked startup
+does not initialize SQLite, open Chroma or attempt deletion recovery. Public routes
+`/`, `/health`, `/docs`, `/redoc` and `/openapi.json` remain available. `GET /health`
+keeps its original response and indicates that the API is alive; it does not certify
+private storage availability. `GET /ready` returns HTTP 503 with
+`{"status":"locked","storage_ready":false}` or an unavailable state, or HTTP 200
+with `{"status":"ready","storage_ready":true,"mode":"disabled"}`. Readiness
+checks configuration/attributes but does not initialize databases or write files.
+Readiness never asserts that data is encrypted.
+
+### Temporary-file policy and its limits
+
+Inspection of the pinned Starlette parser found a 1 MiB upload spool threshold;
+larger uploads can reach disk before the existing 20 MiB handler check. The guard
+rejects locked uploads before parsing. Accepted RecallIQ requests use an explicit
+private `dir` in a request-context-aware spool factory, with path revalidation at
+disk rollover. This narrowly replaces the parser's factory because its pinned API
+offers no directory parameter; requests in other applications without RecallIQ's
+context keep the original factory. Framework upgrades must rerun these integration
+tests. There is still no incoming request-body quota: accepted multipart bodies can
+consume disk before file-size validation.
+
+`python -m app.run` establishes `TEMP`, `TMP`, `TMPDIR`, `SQLITE_TMPDIR` and Python's
+cached `tempfile.tempdir` before importing Uvicorn and the application. Environment
+variables alone are insufficient when Python has cached its directory. If private
+storage is unavailable, the launcher configures no private temporary directory and
+starts only the guarded API. Changing the storage root/configuration requires a
+process restart; live reconfiguration is not supported.
+
+Each application SQLite connection uses `PRAGMA temp_store=MEMORY` for temporary
+tables/sorts. Journaling remains enabled beside the validated database; this setting
+does not govern Chroma's independent SQLite/Rust connections. Chroma is given an
+explicit persistent directory, and the launcher sets inherited native-library temp
+variables. These measures are **not proof that every native-library write is contained**.
+The SQLite and [Python tempfile documentation](https://docs.python.org/3.11/library/tempfile.html)
+describe their separate policies; see also [SQLite temporary files](https://www.sqlite.org/tempfiles.html).
+
+Tests monitor a real 2 MiB multipart spool rollover and its actual Windows temporary
+filename, verify cleanup, test memory-backed SQLite temporary tables, and exercise
+real Windows junctions. They do not trace every Chroma/native OS write. Future volume
+integration needs OS-level tracing (for example Process Monitor) of upload, extraction,
+indexing, search and deletion before claiming complete disk containment. Paging,
+hibernation, crash dumps, antivirus, filesystem caches and backups remain outside
+application-level control. Python does not guarantee secure memory erasure.
+
+FastAPI's native telemetry and automatic exporter setup are explicitly disabled;
+Chroma usage telemetry remains disabled. Existing access logs can still contain
+request URLs/document IDs; do not add request-body, document-content or secret logging.
+Git ignores uploaded PDFs, database files/journals, indexes, temporary data, model
+caches, dump files and prospective `.hc` containers. Ignore rules are not encryption.
+
+The boundary uses path checks, not OS handle-based capabilities: a malicious process
+can race filesystem changes after validation. An active mount disappearing mid-operation,
+native handles surviving in-process, and malicious same-account activity are not solved
+by this milestone. Existing staged deletion and index-generation recovery remain in
+place; no cross-store atomicity or safe dismount/worker lifecycle is claimed.
+
 ## Test
 
 ```powershell
@@ -498,6 +643,9 @@ partial failures, retries, persistence and deletion. Normal tests need no intern
 - `backend/app/keyword.py`: literal queries, SQLite chunk storage and BM25 retrieval.
 - `backend/app/hybrid.py`: candidate selection and Reciprocal Rank Fusion.
 - `backend/app/search.py`: validated semantic, keyword and hybrid retrieval endpoints.
+- `backend/app/storage.py`: private path configuration and trusted verification interface.
+- `backend/app/storage_guard.py`: early ASGI guards and request-local spool placement.
+- `backend/app/run.py`: localhost launcher with early process temporary configuration.
 - `backend/tests/`: health, documentation and PDF tests using FastAPI's TestClient.
 - `backend/requirements.txt`: direct dependencies with pinned versions;
   pip also installs their required dependencies.
