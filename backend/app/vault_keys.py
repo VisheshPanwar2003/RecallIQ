@@ -10,6 +10,7 @@ from pathlib import Path
 from threading import RLock
 from enum import Enum
 from uuid import UUID, uuid4
+from weakref import WeakMethod
 
 from argon2.low_level import Type, hash_secret_raw
 from cryptography.exceptions import InvalidTag
@@ -128,6 +129,7 @@ class VaultKeyManager:
         self._master = None
         self._vault_id = None
         self._mutex = RLock()
+        self._lock_observers = []
         self._state = VaultState.UNINITIALIZED
         try:
             self._root = validate_path(self._root)
@@ -224,6 +226,7 @@ class VaultKeyManager:
 
     def unlock(self, password: str):
         with self._mutex:
+            self._invalidate_dependents()
             self._master = None
             self._vault_id = None
             try:
@@ -248,10 +251,25 @@ class VaultKeyManager:
 
     def lock(self):
         with self._mutex:
+            self._invalidate_dependents()
             self._master = None  # reference release, NOT secure memory erasure
             self._vault_id = None
             if self._state == VaultState.UNLOCKED:
                 self._state = VaultState.LOCKED
+
+    def _observe_lock(self, callback):
+        """Internal weak observer: dependent storage must close on key revocation."""
+        with self._mutex:
+            self._lock_observers.append(WeakMethod(callback))
+
+    def _invalidate_dependents(self):
+        live = []
+        for reference in self._lock_observers:
+            callback = reference()
+            if callback is not None:
+                callback()
+                live.append(reference)
+        self._lock_observers = live
 
     def _subkey(self, purpose: str):
         """Storage-worker integration seam; never expose this through HTTP."""

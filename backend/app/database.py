@@ -99,30 +99,35 @@ def initialize_database(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with connect(path) as connection:
         connection.execute("BEGIN IMMEDIATE")
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS documents (
-                id TEXT PRIMARY KEY NOT NULL CHECK(length(id) = 36),
-                original_filename TEXT NOT NULL CHECK(length(trim(original_filename)) > 0),
-                stored_filename TEXT NOT NULL UNIQUE CHECK(stored_filename = id || '.pdf'),
-                file_size_bytes INTEGER NOT NULL CHECK(typeof(file_size_bytes) = 'integer' AND file_size_bytes >= 0),
-                total_pages INTEGER NOT NULL CHECK(typeof(total_pages) = 'integer' AND total_pages >= 0),
-                total_characters INTEGER NOT NULL CHECK(typeof(total_characters) = 'integer' AND total_characters >= 0),
-                created_at TEXT NOT NULL CHECK(length(created_at) > 0)
-            )
-        """)
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS document_indexes (
-                document_id TEXT PRIMARY KEY NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-                generation TEXT NOT NULL CHECK(length(generation) = 64),
-                embedding_config TEXT NOT NULL CHECK(length(embedding_config) > 0)
-            )
-        """)
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS vector_cleanup (
-                document_id TEXT PRIMARY KEY NOT NULL
-            )
-        """)
-        migrate_keyword_schema(connection)
+        initialize_schema(connection)
+
+
+def initialize_schema(connection):
+    """Shared logical schema; caller owns transaction and connection policy."""
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS documents (
+            id TEXT PRIMARY KEY NOT NULL CHECK(length(id) = 36),
+            original_filename TEXT NOT NULL CHECK(length(trim(original_filename)) > 0),
+            stored_filename TEXT NOT NULL UNIQUE CHECK(stored_filename = id || '.pdf'),
+            file_size_bytes INTEGER NOT NULL CHECK(typeof(file_size_bytes) = 'integer' AND file_size_bytes >= 0),
+            total_pages INTEGER NOT NULL CHECK(typeof(total_pages) = 'integer' AND total_pages >= 0),
+            total_characters INTEGER NOT NULL CHECK(typeof(total_characters) = 'integer' AND total_characters >= 0),
+            created_at TEXT NOT NULL CHECK(length(created_at) > 0)
+        )
+    """)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS document_indexes (
+            document_id TEXT PRIMARY KEY NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            generation TEXT NOT NULL CHECK(length(generation) = 64),
+            embedding_config TEXT NOT NULL CHECK(length(embedding_config) > 0)
+        )
+    """)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS vector_cleanup (
+            document_id TEXT PRIMARY KEY NOT NULL
+        )
+    """)
+    migrate_keyword_schema(connection)
 
 
 class DocumentStore:
@@ -131,9 +136,12 @@ class DocumentStore:
         # Explicit lazy initialization also supports clients without lifespan.
         initialize_database(path)
 
+    def connection(self):
+        return connect(self.path)
+
     def insert(self, result: DocumentUploadResponse, file_size_bytes: int) -> None:
         document_id = str(result.document_id)
-        with connect(self.path) as connection:
+        with self.connection() as connection:
             connection.execute("""
                 INSERT INTO documents
                 (id, original_filename, stored_filename, file_size_bytes,
@@ -146,13 +154,13 @@ class DocumentStore:
             ))
 
     def list(self):
-        with connect(self.path) as connection:
+        with self.connection() as connection:
             return [dict(row) for row in connection.execute(
                 "SELECT * FROM documents ORDER BY created_at DESC, id DESC"
             )]
 
     def get(self, document_id: str):
-        with connect(self.path) as connection:
+        with self.connection() as connection:
             row = connection.execute(
                 "SELECT * FROM documents WHERE id = ?", (document_id,)
             ).fetchone()
