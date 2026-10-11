@@ -8,3 +8,5 @@ sentence-transformers==6.1.0
 chromadb==1.5.9
 cryptography==50.0.2
 argon2-cffi==25.1.0
+sqlcipher3==0.6.3
+numpy==2.4.6

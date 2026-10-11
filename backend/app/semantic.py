@@ -5,7 +5,7 @@ from pathlib import Path
 from threading import RLock
 
 from app.chunking import chunk_pages
-from app.database import DocumentStore, connect
+from app.database import DocumentStore
 from app.document_management import DocumentNotFound, delete_document, storage_paths
 from app.pdf_extraction import extract_pages
 from app.vectors import IndexUnavailable
@@ -17,7 +17,7 @@ semantic_lock = RLock()
 
 
 def active_indexes(store: DocumentStore, document_ids=()):
-    with connect(store.path) as connection:
+    with store.connection() as connection:
         rows = connection.execute("""
             SELECT documents.id, documents.original_filename, document_indexes.generation,
                    document_indexes.embedding_config FROM documents
@@ -28,11 +28,11 @@ def active_indexes(store: DocumentStore, document_ids=()):
 
 
 def drain_vector_cleanup(store, vectors, config):
-    with connect(store.path) as connection:
+    with store.connection() as connection:
         ids = [row[0] for row in connection.execute("SELECT document_id FROM vector_cleanup")]
     for document_id in ids:
         vectors.remove(document_id, config)
-        with connect(store.path) as connection:
+        with store.connection() as connection:
             connection.execute("DELETE FROM vector_cleanup WHERE document_id = ?", (document_id,))
 
 
@@ -59,7 +59,7 @@ def index_document(store, directory: Path, vectors, embedder, document_id: str):
                                            chunk_ids=chunk_ids)
         if current and current["generation"] == generation and not vector_complete:
             # Lost/edited vector data must be hidden while reconstructing it.
-            with connect(store.path) as connection:
+            with store.connection() as connection:
                 connection.execute("DELETE FROM document_indexes WHERE document_id = ?", (document_id,))
                 connection.execute("DELETE FROM keyword_indexes WHERE document_id = ?", (document_id,))
         # Partial generations are invisible; retry upserts deterministic IDs.
@@ -70,7 +70,7 @@ def index_document(store, directory: Path, vectors, embedder, document_id: str):
             if not vectors.complete(document_id, generation, len(chunks), embedder.config,
                                     chunk_ids=chunk_ids):
                 raise RuntimeError("Vector write did not complete")
-        with connect(store.path) as connection:
+        with store.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             if connection.execute("SELECT id FROM documents WHERE id = ?", (document_id,)).fetchone() is None:
                 raise DocumentNotFound()

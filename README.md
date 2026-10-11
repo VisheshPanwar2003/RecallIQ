@@ -16,13 +16,17 @@ The backend foundation, PDF extraction, SQLite management and all three retrieva
 - SQLite FTS5 keyword search with BM25 and Reciprocal Rank Fusion (RRF) hybrid search.
 - Automated tests using generated PDFs and isolated temporary directories.
 - Centralized private-storage configuration, early locked-vault guards and readiness status.
+- Internal password-protected key envelopes, SQLCipher storage and in-memory NumPy retrieval.
 
-There is no authentication, encryption, LLM answer generation, RAG or agent integration.
+Public document/search endpoints remain unencrypted development functionality.
+The built-in vault foundation is internal-only; encrypted PDF ingestion and general
+vault HTTP access are blocked. There is no HTTP authentication, LLM answer generation,
+RAG or agent integration.
 
 ## Planned features (not implemented)
 
 - Broader document ingestion and knowledge management.
-- An encrypted local vault.
+- Complete encrypted vault ingestion, lifecycle isolation and explicit data migration.
 - System 1/System 2 routing and local LLM support through Ollama.
 - Agentic RAG through LangGraph.
 - Privacy guardrails and explicit consent for optional cloud requests.
@@ -31,7 +35,9 @@ There is no authentication, encryption, LLM answer generation, RAG or agent inte
 ## Technology stack and prerequisites
 
 Current stack: Python, FastAPI, Uvicorn, PyMuPDF, python-multipart, built-in sqlite3,
-Sentence Transformers, ChromaDB, pytest and httpx. SQLite requires no additional package.
+Sentence Transformers, ChromaDB, pytest and httpx, plus cryptography/Argon2id,
+SQLCipher and NumPy for the internal vault foundation. Development SQLite uses
+the standard library; encrypted storage requires the separate SQLCipher binding.
 PyMuPDF opens PDFs and extracts text; python-multipart parses upload form data.
 All direct dependencies and their versions are listed in `backend/requirements.txt`.
 Install Python 3.11 or newer with SQLite FTS5 support, and Git. Commands below use Windows PowerShell.
@@ -384,7 +390,8 @@ own passage copy for semantic responses; derived plaintext duplication across st
 remains. Existing PDFs require calling `/documents/{id}/index` once after upgrading
 to populate keyword data; no upload or destructive metadata rebuild is needed.
 
-FTS text and posting lists, Chroma data, SQLite and PDFs are **unencrypted**.
+In development mode, FTS text and posting lists, Chroma data, SQLite and PDFs are
+**unencrypted**. The Task 9 internal SQLCipher store is described separately below.
 All three retrieval modes run locally and do not send queries or text to AI APIs.
 The future vault must protect source files, derived text, indexes, database journals
 and backups. Deleting a document removes its logical records but does not guarantee
@@ -471,7 +478,7 @@ unchanged in both stores) and deletion were verified. Generated artifacts are ig
 
 ## Secure storage boundary and vault guards
 
-This milestone prepares the storage boundary. **It implements no encryption,
+The earlier storage-boundary milestone alone implements **no encryption,
 VeraCrypt mounting, passwords, migration, unlocking API or worker orchestration.**
 An ordinary directory is not an encrypted volume. Source PDFs, metadata, FTS terms,
 chunk text and embeddings remain plaintext with the current development setup.
@@ -626,6 +633,89 @@ partial failures, retries, persistence and deletion. Normal tests need no intern
 
 ## Files and concepts
 
+### Internal encrypted database and retrieval (Task 9)
+
+This milestone integrates the encrypted database through internal services using
+generated/in-memory page data. It **does not activate vault HTTP endpoints**, copy
+existing databases, upload encrypted PDFs or change development storage defaults.
+`RECALLIQ_VAULT_MODE=disabled` retains SQLite and persistent Chroma development
+behavior; `external` remains fail-closed behind the trusted verifier. There is no
+built-in HTTP-unlock environment flag or password endpoint.
+
+`VaultDocumentStore(owner, embedding_config, create=True)` creates a new encrypted
+`database.sqlite3` inside an explicitly initialized and unlocked key-manager root.
+Omit `create` to reopen an existing database: missing, empty, wrong-key, corrupt or
+unsupported databases fail without recreation, repair, migration or SQLite fallback.
+Creation is exclusive; interrupted initialization requires explicit inspection.
+The internal HKDF database subkey is supplied to SQLCipher only in memory.
+
+Windows x64 CPython 3.11 was verified with `sqlcipher3==0.6.3`, SQLCipher 4.12.0
+community and SQLite 3.51.1. The wheel includes the native library; no separate
+SQLCipher compiler/installer is needed for this tested environment. Install with
+the normal requirements command above, or install the tested wheel explicitly:
+
+```powershell
+.\backend\.venv\Scripts\python.exe -m pip install --only-binary=:all: sqlcipher3==0.6.3
+```
+
+The internal store checks codec/FTS5 support and the supported SQLCipher 4.12.x
+profile. It sets and verifies HMAC, a zero-length plaintext header, 4096-byte cipher
+pages, SQLCipher memory security, memory-backed temporary storage, foreign keys,
+disabled mmap and FULL synchronous writes. Extension loading and native cipher
+logging are disabled. Connections are short-lived and close in `finally`; every
+open uses `mode=rw`, which cannot silently create a missing database. Startup
+checks page authentication and SQLite integrity. This is application initialization,
+not a dependency requirement for starting the unencrypted development API.
+
+Encrypted schema versions 1 and 2 reuse the existing document metadata, chunk
+rows, FTS5 external-content triggers, manifests and cleanup queue. Version 2 adds
+vault identity/configuration, a revision counter and embedding rows referencing
+the existing chunk row IDs. Embedding format v1 is a **little-endian float32 BLOB**,
+with a version, dimensions and exact byte-length checks. Full model/revision
+configuration is stored encrypted and must match on reopen and search. Invalid,
+non-finite, zero-length-direction or incompatible vectors are rejected.
+
+`VaultSearchService` indexes already-in-memory pages using the existing UUID-based
+chunker, commits chunk/FTS/vector/manifests in one transaction and then reloads its
+index. Database revision triggers detect updates/deletions; refresh errors clear
+the cache and cannot return an old snapshot. Existing semantic helpers, literal
+FTS5/BM25 queries and RRF (k=60) provide the same result shapes, citations, document
+filters and request limits. Internal deletion affects encrypted rows only and
+cascades through chunks/embeddings/FTS; it does not implement PDF file deletion.
+
+NumPy uses exact normalized cosine distance, with deterministic chunk-ID ties.
+Chroma remains the development approximate-neighbor backend and is never opened
+by the private adapter. NumPy does not write an index to disk. The MVP accepts
+**10,000 chunks**, dimensions up to **384**, 800-character chunks and **16 MiB**
+of indexed UTF-8 text plus repeated source-filename bytes. Limits are checked before
+loading and during updates. The 384-dimensional matrix occupies about **14.65 MiB**;
+decrypted rows, temporary arrays, metadata, SQLCipher and the model require more RAM.
+These limits are not a guaranteed total-process working-set bound.
+
+Measured on this Windows machine with generated 10,000-chunk/384-dimensional data:
+indexing about 16.1 seconds and median semantic search about 147 ms across 15
+queries, including SQLCipher connection/citation work. Benchmark embeddings were
+synthetic; a separate small-corpus check used the real pinned all-MiniLM-L6-v2
+model and successfully exercised semantic, keyword and hybrid modes. Measurements
+are illustrative, not a service-level guarantee or real-corpus quality evaluation.
+
+All internal operations share the key owner's mutex. Locking waits for active
+work, closes registered stores and drops snapshots immediately; unlocking again
+requires a new store/service instance. Weak observers avoid retaining discarded
+stores. This is cooperative single-process ownership, **not a dedicated worker**
+or cross-process lock protocol. Plaintext Python values already returned to callers
+cannot be erased. Paging, dumps, hibernation, native artifacts, inherited Windows
+ACLs, filesystem races and power-loss recovery remain limitations. Model input
+still truncates at 256 tokens. Plaintext multipart spills are unchanged in
+development; vault-mode uploads remain blocked until encrypted ingestion is built.
+
+Tests use real SQLCipher and disposable vaults, exercising wrong keys/corruption,
+ordinary SQLite rejection, FTS/BM25, WAL/journal canary checks, malformed vectors,
+idempotence, filters/ties/citations, deletion/reload, refresh failures and locking.
+Canary absence is evidence for tested files, not a comprehensive OS write audit.
+See the [SQLCipher design](https://www.zetetic.net/sqlcipher/design/) and
+[configuration API](https://www.zetetic.net/sqlcipher/sqlcipher-api/).
+
 ### Internal vault key foundation (Task 8)
 
 `app.vault_keys.VaultKeyManager` is an internal interface with
@@ -698,6 +788,9 @@ production retrieval, implement password recovery, or contain paging/crash dumps
 - `backend/app/search.py`: validated semantic, keyword and hybrid retrieval endpoints.
 - `backend/app/storage.py`: private path configuration and trusted verification interface.
 - `backend/app/storage_guard.py`: early ASGI guards and request-local spool placement.
+- `backend/app/vault_keys.py`: internal versioned key envelopes and key ownership.
+- `backend/app/vault_database.py`: internal SQLCipher connections and encrypted schema.
+- `backend/app/vault_search.py`: bounded private NumPy index and shared retrieval adapter.
 - `backend/app/run.py`: localhost launcher with early process temporary configuration.
 - `backend/tests/`: health, documentation and PDF tests using FastAPI's TestClient.
 - `backend/requirements.txt`: direct dependencies with pinned versions;
