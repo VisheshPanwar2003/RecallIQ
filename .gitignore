@@ -39,6 +39,8 @@ temp/
 *.pem
 *.key
 *.pdf
+*.rpdf
+*.rpdf.pending
 *.hc
 *.dmp
 .aws/

@@ -7,7 +7,10 @@ import base64
 import json
 import os
 from pathlib import Path
-from threading import RLock
+from threading import RLock, Lock, current_thread
+from threading import Condition, Event
+from contextlib import contextmanager
+from contextvars import ContextVar
 from enum import Enum
 from uuid import UUID, uuid4
 from weakref import WeakMethod
@@ -25,6 +28,7 @@ ENVELOPE_NAME = "key-envelope.json"
 MAX_ENVELOPE_BYTES = 4096
 KDF = {"algorithm": "argon2id", "version": 19, "memory_kib": 65536,
        "iterations": 3, "parallelism": 4, "length": 32}
+_operation_owner = ContextVar("vault_operation_owner", default=None)
 
 
 class VaultState(str, Enum):
@@ -129,6 +133,12 @@ class VaultKeyManager:
         self._master = None
         self._vault_id = None
         self._mutex = RLock()
+        self._condition = Condition(self._mutex)
+        self._locking = Event()
+        self._active_operations = 0
+        self._leases = set()
+        self._transition_gate = Lock()
+        self._transition_requests = 0
         self._lock_observers = []
         self._state = VaultState.UNINITIALIZED
         try:
@@ -225,11 +235,18 @@ class VaultKeyManager:
             self._state = VaultState.ERROR
 
     def unlock(self, password: str):
+        with self._transition():
+            with self._condition:
+                while self._active_operations:
+                    self._condition.wait()
+                self._unlock_locked(password)
+
+    def _unlock_locked(self, password):
         with self._mutex:
-            self._invalidate_dependents()
             self._master = None
             self._vault_id = None
             try:
+                self._invalidate_dependents()
                 encoded = _password_bytes(password)
                 envelope = self._read_envelope()
                 header = envelope["header"]
@@ -250,12 +267,67 @@ class VaultKeyManager:
                 raise UnlockFailed() from None
 
     def lock(self):
-        with self._mutex:
-            self._invalidate_dependents()
-            self._master = None  # reference release, NOT secure memory erasure
-            self._vault_id = None
-            if self._state == VaultState.UNLOCKED:
-                self._state = VaultState.LOCKED
+        with self._transition():
+            with self._condition:
+                while self._active_operations:
+                    self._condition.wait()
+                try:
+                    self._invalidate_dependents()
+                finally:
+                    self._master = None  # reference release, NOT secure erasure
+                    self._vault_id = None
+                    if self._state == VaultState.UNLOCKED:
+                        self._state = VaultState.LOCKED
+
+    @contextmanager
+    def _transition(self):
+        if self._owns_operation():
+            raise VaultError()  # A lease cannot wait for itself to finish.
+        with self._transition_gate:
+            self._transition_requests += 1
+            self._locking.set()
+        try:
+            yield
+        finally:
+            with self._transition_gate:
+                self._transition_requests -= 1
+                if not self._transition_requests:
+                    self._locking.clear()
+
+    def _available(self):
+        return self._state == VaultState.UNLOCKED and (
+            not self._locking.is_set() or self._owns_operation())
+
+    def _owns_operation(self):
+        # Copied contexts cannot borrow another thread's lease, or revive an
+        # expired lease in the original thread. Thread objects avoid ID reuse.
+        lease = _operation_owner.get()
+        return (lease is not None and lease[0] is self and
+                lease[1] in self._leases and lease[2] is current_thread())
+
+    @contextmanager
+    def _operation(self):
+        """Cooperative lease: CPU work can release mutex while lock waits safely."""
+        if self._owns_operation():
+            yield
+            return
+        if self._locking.is_set():
+            raise VaultError()  # Reject before waiting behind a busy DB mutex.
+        with self._condition:
+            if not self._available():
+                raise VaultError()
+            self._active_operations += 1
+            lease = object()
+            self._leases.add(lease)
+        token = _operation_owner.set((self, lease, current_thread()))
+        try:
+            yield
+        finally:
+            _operation_owner.reset(token)
+            with self._condition:
+                self._leases.remove(lease)
+                self._active_operations -= 1
+                self._condition.notify_all()
 
     def _observe_lock(self, callback):
         """Internal weak observer: dependent storage must close on key revocation."""
@@ -264,17 +336,23 @@ class VaultKeyManager:
 
     def _invalidate_dependents(self):
         live = []
+        failed = False
         for reference in self._lock_observers:
             callback = reference()
             if callback is not None:
-                callback()
+                try:
+                    callback()
+                except Exception:
+                    failed = True
                 live.append(reference)
         self._lock_observers = live
+        if failed:
+            raise VaultError() from None
 
     def _subkey(self, purpose: str):
         """Storage-worker integration seam; never expose this through HTTP."""
         with self._mutex:
-            if self._state != VaultState.UNLOCKED or self._master is None or purpose not in {"database", "document"}:
+            if not self._available() or self._master is None or purpose not in {"database", "document"}:
                 raise VaultError()
             return HKDF(algorithm=hashes.SHA256(), length=32,
                         salt=UUID(self._vault_id).bytes,
