@@ -1,5 +1,7 @@
 # Python environments and caches
 .venv/
+.venv*/
+.python311-runtime/
 venv/
 env/
 __pycache__/
