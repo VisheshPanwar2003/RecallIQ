@@ -108,14 +108,22 @@ class VaultDocumentStore(DocumentStore):
                     if not actual or int(actual[0]) != value:
                         raise VaultDatabaseUnavailable()
                 connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
-                with connection:
-                    yield connection
             except Exception:
                 self._snapshot = None
                 raise VaultDatabaseUnavailable() from None
+            try:
+                # Keep driver/setup failures fail-closed, but preserve deliberate
+                # domain exceptions raised by the operation using this context.
+                # Otherwise migration authorization and integrity errors are
+                # flattened into a generic database error.
+                try:
+                    with connection:
+                        yield connection
+                except driver.Error:
+                    self._snapshot = None
+                    raise VaultDatabaseUnavailable() from None
             finally:
-                if connection is not None:
-                    connection.close()
+                connection.close()
 
     def _create_schema(self, connection):
         connection.execute("BEGIN IMMEDIATE")
@@ -140,7 +148,7 @@ class VaultDocumentStore(DocumentStore):
 
     def _validate_schema(self, connection):
         versions = [row[0] for row in connection.execute("SELECT version FROM vault_schema_migrations ORDER BY version")]
-        if versions not in ([1, 2], [1, 2, 3]):
+        if versions not in ([1, 2], [1, 2, 3], [1, 2, 3, 4]):
             raise VaultDatabaseUnavailable()
         info = connection.execute("SELECT vault_id,embedding_config FROM vault_info WHERE id=1").fetchone()
         if not info or info[0] != self.owner._vault_id or info[1] != self.config_json:

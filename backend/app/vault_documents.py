@@ -225,6 +225,7 @@ its own read deadline. No promise of interrupting arbitrary synchronous I/O.
                       (doc_id, pending['filename'], doc_id + '.pdf', pending['size'], pending['pages'], pending['characters'], pending['created_at']))
             c.execute('INSERT INTO vault_document_pages SELECT * FROM vault_pending_pages WHERE document_id=?', (doc_id,))
             c.execute('INSERT INTO vault_document_files VALUES(?,?,?,?)', (doc_id, row['digest'], row['cipher_size'], row['nonce']))
+            self._commit_ingest(c, doc_id)
             c.execute('DELETE FROM vault_pending_documents WHERE document_id=?', (doc_id,))
             c.execute("UPDATE vault_document_operations SET state='COMMITTED' WHERE document_id=?", (doc_id,))
             self._checkpoint('before_commit')
@@ -233,6 +234,16 @@ its own read deadline. No promise of interrupting arbitrary synchronous I/O.
         with self.store.connection() as c:
             c.execute('UPDATE vault_document_operations SET stage_owned=0 WHERE document_id=?', (doc_id,))
         self._checkpoint('cleaned')
+
+    def _commit_ingest(self, connection, doc_id):
+        """Internal transaction seam: migration must verify its indexes first.
+
+        Ordinary recovery cannot accidentally publish a migration-owned PDF
+        without its preserved chunks and regenerated embeddings.
+        """
+        if connection.execute("SELECT 1 FROM sqlite_master WHERE name='vault_migration_documents'").fetchone():
+            if connection.execute('SELECT 1 FROM vault_migration_documents WHERE document_id=?', (doc_id,)).fetchone():
+                raise EncryptedDocumentError()
 
     def decrypt(self, doc_id):
         with operation_reservation(self.owner):

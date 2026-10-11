@@ -321,7 +321,12 @@ class VaultKeyManager:
             self._leases.add(lease)
         token = _operation_owner.set((self, lease, current_thread()))
         try:
-            yield
+            from app.vault_exclusive import exclusive_vault, ExclusiveUnavailable
+            try:
+                with exclusive_vault(self._root):
+                    yield
+            except ExclusiveUnavailable:
+                raise VaultError() from None
         finally:
             _operation_owner.reset(token)
             with self._condition:

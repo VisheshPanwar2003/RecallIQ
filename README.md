@@ -18,6 +18,7 @@ The backend foundation, PDF extraction, SQLite management and all three retrieva
 - Centralized private-storage configuration, early locked-vault guards and readiness status.
 - Internal password-protected key envelopes, SQLCipher storage and in-memory NumPy retrieval.
 - Internal authenticated encrypted PDF ingestion, in-memory extraction and recoverable deletion.
+- Offline migration into an unlocked encrypted vault with source read-only guards, local re-embedding, verification and explicit rollback.
 
 Public document/search endpoints remain unencrypted development functionality.
 The built-in vault services are internal-only; public vault uploads and general
@@ -27,7 +28,7 @@ RAG or agent integration.
 ## Planned features (not implemented)
 
 - Broader document ingestion and knowledge management.
-- Vault HTTP integration, isolated worker lifecycle and explicit data migration.
+- Vault HTTP integration and isolated worker lifecycle.
 - System 1/System 2 routing and local LLM support through Ollama.
 - Agentic RAG through LangGraph.
 - Privacy guardrails and explicit consent for optional cloud requests.
@@ -618,6 +619,123 @@ native handles surviving in-process, and malicious same-account activity are not
 by this milestone. Existing staged deletion and index-generation recovery remain in
 place; no cross-store atomicity or safe dismount/worker lifecycle is claimed.
 
+## Offline migration into an encrypted vault
+
+Task 11 adds an internal command-line workflow for copying the supported local
+development store into an already initialized and unlocked SQLCipher vault. It
+does not expose migration, unlock, or recovery over HTTP and does not create a
+vault implicitly. The source SQLite schema must be migration version 1 (the
+current documents/chunks/FTS5 schema); the destination must have the Task 10
+document schema version 3 and is extended transactionally to migration schema
+version 4. Unsupported or partially created schemas fail closed.
+
+Migration requires the pinned Python dependencies, the locally cached
+`all-MiniLM-L6-v2` model at the configured revision, an unlocked destination,
+and exclusive access to the source. Preflight runs the local embedder offline,
+checks source SQLite integrity and relationships, validates every PDF and its
+extracted pages/chunks, checks destination capacity, and confirms that source
+and destination paths do not overlap. Source schema version 1 uses 800-character
+chunks with 120-character overlap; a source with a different chunk inventory is
+rejected rather than partially migrated. Limits are 128 MiB for the source
+database, 20 MiB per PDF, 10,000 chunks, and 16 MiB for indexed/page text. The
+preflight reserves an estimated `3 x total PDF bytes + 8 x extracted page-text
+bytes + 64 MiB` of free destination space. Migration processes documents
+sequentially and embeds at most 32 chunks per batch; the embedding model's own
+memory use is additional and depends on the machine.
+
+From `backend/` in PowerShell, the password is requested with a hidden console
+prompt; never pass it as an argument or environment variable. These commands
+require an existing vault and do not initialize one:
+
+```powershell
+Set-Location D:\RecallIQ\backend
+$python = ".\.venv\Scripts\python.exe"
+$vault = "D:\RecallIQ-Vault"
+$sourceDb = "D:\RecallIQ\backend\data\recalliq.sqlite3"
+$sourceUploads = "D:\RecallIQ\backend\uploads"
+
+# 1. Read-only preflight; no destination migration rows are created.
+& $python -m app.migrate_vault preflight --vault $vault `
+  --source-database $sourceDb --source-uploads $sourceUploads
+
+# 2. Execute (prints a migration ID before writing, for later recovery).
+& $python -m app.migrate_vault migrate --vault $vault `
+  --source-database $sourceDb --source-uploads $sourceUploads
+
+# 3. Verify an existing migration by its returned ID.
+$migrationId = "<migration-id>"
+& $python -m app.migrate_vault verify --vault $vault --migration-id $migrationId
+
+# 4. Resume/recover using the same unchanged source and migration ID.
+& $python -m app.migrate_vault resume --vault $vault --migration-id $migrationId `
+  --source-database $sourceDb --source-uploads $sourceUploads
+
+# 5. Roll back only after the CLI prompts for explicit confirmation.
+& $python -m app.migrate_vault rollback --vault $vault --migration-id $migrationId
+```
+
+The source SQLite database is opened with `mode=ro`, `immutable=1`, query-only
+settings and integrity checks. Non-empty rollback journals or WAL files are
+rejected. Windows file-sharing handles deny writes/deletes to the database and
+each inventoried PDF while the migration runs; a named mutex coordinates with
+RecallIQ's own development server, whose HTTP requests return 503 while the
+offline command owns the source. These OS locks do not stop a privileged local
+process or arbitrary software from manipulating unrelated files. Stop other
+applications using the source before migration. Existing PDFs and the database
+are fingerprinted and rechecked; the workflow never checkpoints, repairs,
+renames, deletes or writes to source paths.
+
+RecallIQ deliberately does not open or modify the original ChromaDB index.
+It validates the SQLite document/chunk manifests and PDF-derived chunk inventory,
+preserves document IDs, deterministic chunk IDs, metadata and page citations,
+then regenerates embeddings locally from the extracted chunk text. The source
+embedding configuration must exactly match the local model configuration. The
+new PDF is stored in the destination using Task 10's versioned AES-256-GCM
+format, with vault/document identity authenticated. Extracted pages, chunks,
+FTS5 rows and regenerated float32 embeddings are stored in SQLCipher; no
+plaintext PDF, text dump, Chroma store or migration temporary file is created.
+Source PDFs are re-extracted in memory and compared with stored page/chunk
+metadata. Verification checks encrypted database integrity, FTS5 consistency,
+authenticated PDF decryption and hash preservation, and filtered semantic,
+keyword and hybrid retrieval citations before marking completion.
+
+The durable destination state is `COPYING` to `VERIFYING` to `VERIFIED`, with
+`INTERRUPTED` available for retry. Each document moves through `PLANNED`,
+`PREPARED`, and `VERIFIED`; generated plans and intermediate vectors remain
+inside SQLCipher. Incomplete documents are not visible to retrieval. Repeating
+`resume` with the same source and migration ID is idempotent; a changed source,
+ID conflict, malformed manifest or unknown state fails closed. Recovery only
+uses manifest-identified document IDs and never scans for files to delete.
+
+Rollback requires the CLI confirmation phrase, and a previously `VERIFIED`
+migration requires a second, separate confirmation. Before deleting anything,
+rollback validates ownership of every record, compares destination metadata,
+pages, chunks and manifests to the authenticated migration plan, and verifies
+any ciphertext and decrypted source hash. Ambiguous state aborts the whole
+precheck and requires manual inspection. Deletion uses Task 10's logical
+tombstones and retryable ciphertext cleanup; rollback is safe to repeat after
+interruption. It never removes the source or an unrelated destination record.
+
+Example successful synthetic output:
+
+```json
+{"status":"VERIFIED","documents":1,"chunks":2,"embeddings":2,"embedding_strategy":"local-regeneration","model":"generated-migration-test","dimensions":3}
+```
+
+Example failed preflight output (for an unsupported source schema):
+
+```json
+{"status":"FAILED","code":"unsupported_source_schema"}
+```
+
+**Migration into an encrypted vault does not encrypt, overwrite, or securely
+erase the original plaintext SQLite database, ChromaDB files, PDFs, backups,
+filesystem snapshots, or previously deleted disk blocks.** Keep the old source
+protected and manage its disposal separately. Migration does not claim complete
+at-rest confidentiality while accessible plaintext copies remain. It also does
+not promise secure deletion, Windows ACL isolation, power-loss durability, or
+protection from OS paging, crash dumps, or privileged local software.
+
 ## Test
 
 ```powershell
@@ -628,6 +746,9 @@ Set-Location D:\RecallIQ\backend
 Tests cover existing endpoints, documentation, PDF extraction and rejection cases,
 size boundaries and cleanup failures. PDFs are generated in memory, and storage
 is redirected to pytest temporary directories; real uploads are never used.
+Migration tests use synthetic source databases/PDFs and disposable encrypted
+vaults; they verify unchanged source hashes, regenerated search indexes, crash
+resume, explicit rollback and refusal to remove changed destination records.
 Keyword/hybrid tests use real temporary FTS5 and Chroma stores with deterministic
 fake embeddings, covering migration, query syntax, BM25, RRF, filtering, stable IDs,
 partial failures, retries, persistence and deletion. Normal tests need no internet.
