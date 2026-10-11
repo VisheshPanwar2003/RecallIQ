@@ -6,3 +6,5 @@ PyMuPDF==1.28.2
 python-multipart==0.0.32
 sentence-transformers==6.1.0
 chromadb==1.5.9
+cryptography==50.0.2
+argon2-cffi==25.1.0
