@@ -4,6 +4,7 @@ from threading import Lock
 import pymupdf
 
 from app.schemas import ExtractedPage
+from app.storage import check_private_path
 
 
 class InvalidPDF(ValueError):
@@ -17,6 +18,7 @@ pymupdf.TOOLS.mupdf_display_warnings(False)
 
 
 def extract_pages(path: Path) -> list[ExtractedPage]:
+    path = check_private_path(path)
     with _pdf_lock:
         try:
             # Open capped upload bytes so a native open failure cannot keep a

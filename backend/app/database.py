@@ -1,15 +1,15 @@
 from contextlib import contextmanager
 from datetime import datetime, timezone
-import os
 from pathlib import Path
 import sqlite3
 
 from fastapi import Depends, HTTPException
 
 from app.schemas import DocumentUploadResponse
-
-
-BACKEND_DIRECTORY = Path(__file__).resolve().parents[1]
+from app.storage import (
+    BACKEND_DIRECTORY, check_private_path, get_private_storage,
+    validate_path, StorageUnavailable,
+)
 
 
 class FTSUnavailable(RuntimeError):
@@ -73,16 +73,21 @@ def migrate_keyword_schema(connection):
 
 
 def get_database_path() -> Path:
-    value = Path(os.environ.get("RECALLIQ_DATABASE_PATH", "data/recalliq.sqlite3"))
-    return value if value.is_absolute() else BACKEND_DIRECTORY / value
+    return get_private_storage().database
 
 
 @contextmanager
 def connect(path: Path):
+    storage = get_private_storage()
+    path = validate_path(path, root=storage.root)
+    for suffix in ("-journal", "-wal", "-shm"):
+        validate_path(Path(str(path) + suffix), root=storage.root)
     connection = sqlite3.connect(path, timeout=10)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
     try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        # This governs application SQLite, not Chroma's independent connection.
+        connection.execute("PRAGMA temp_store = MEMORY")
         with connection:
             yield connection
     finally:
@@ -90,6 +95,7 @@ def connect(path: Path):
 
 
 def initialize_database(path: Path) -> None:
+    path = check_private_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with connect(path) as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -157,6 +163,8 @@ def get_document_store(path: Path = Depends(get_database_path)) -> DocumentStore
     try:
         return DocumentStore(path)
     except FTSUnavailable as error:
+        raise HTTPException(503, str(error)) from error
+    except StorageUnavailable as error:
         raise HTTPException(503, str(error)) from error
     except (sqlite3.Error, OSError) as error:
         raise HTTPException(500, "Document storage is unavailable.") from error

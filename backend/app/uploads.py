@@ -1,10 +1,10 @@
 from pathlib import Path
-import os
 from typing import BinaryIO
 from uuid import uuid4
 
 from app.pdf_extraction import InvalidPDF, extract_pages
 from app.schemas import DocumentUploadResponse
+from app.storage import get_private_storage, check_private_path
 
 
 MAX_FILE_SIZE = 20 * 1024 * 1024
@@ -19,8 +19,7 @@ class UploadRejected(ValueError):
 
 
 def get_uploads_directory() -> Path:
-    value = Path(os.environ.get("RECALLIQ_UPLOADS_DIRECTORY", str(UPLOADS_DIRECTORY)))
-    return value if value.is_absolute() else UPLOADS_DIRECTORY.parent / value
+    return get_private_storage().uploads
 
 
 def store_and_extract(
@@ -36,8 +35,9 @@ def store_and_extract(
         raise UploadRejected("The file does not have a valid PDF signature.")
 
     document_id = uuid4()
+    directory = check_private_path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{document_id}.pdf"
+    path = check_private_path(directory / f"{document_id}.pdf")
     created = False
     retained = False
     try:

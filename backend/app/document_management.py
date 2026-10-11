@@ -2,6 +2,7 @@ from pathlib import Path
 from uuid import UUID
 
 from app.database import DocumentStore, connect
+from app.storage import check_private_path
 
 
 class DocumentNotFound(ValueError):
@@ -12,10 +13,11 @@ def storage_paths(directory: Path, document_id: str, stored_filename: str):
     # Validate database values too: damaged or edited metadata must not escape storage.
     if str(UUID(document_id)) != document_id or stored_filename != f"{document_id}.pdf":
         raise ValueError("Invalid stored document filename")
-    root = directory.resolve()
+    root = check_private_path(directory)
     original = root / stored_filename
     staged = root / f"{stored_filename}.deleting"
     for path in (original, staged):
+        check_private_path(path)
         if path.is_symlink() or path.resolve().parent != root:
             raise ValueError("Unsafe document storage path")
     return original, staged
@@ -60,6 +62,7 @@ def delete_document(store: DocumentStore, directory: Path, document_id: str) -> 
 
 
 def recover_deletions(store: DocumentStore, directory: Path) -> None:
+    check_private_path(directory)
     if not directory.exists():
         return
     with connect(store.path) as connection:
