@@ -28,6 +28,8 @@ models/
 .cache/
 data/
 vault/
+key-envelope.json
+key-envelope.pending
 logs/
 *.log
 tmp/

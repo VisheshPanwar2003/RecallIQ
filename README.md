@@ -626,6 +626,59 @@ partial failures, retries, persistence and deletion. Normal tests need no intern
 
 ## Files and concepts
 
+### Internal vault key foundation (Task 8)
+
+`app.vault_keys.VaultKeyManager` is an internal interface with
+`initialize(password)`, `unlock(password)` and `lock()`. There is no HTTP password
+endpoint or automatic vault creation. Supply an absolute path to a **new** vault
+directory beneath an existing parent; initialization refuses every existing
+directory, including an empty one. Use an ignored private location such as
+`vault/`. Initialization finishes LOCKED; unlocking is a separate operation.
+
+The v1 JSON envelope contains only public format/version, random UUID vault ID,
+Argon2id profile and salt, AES-GCM nonce, and the authenticated encrypted master
+key. All header fields are authenticated using canonical JSON as associated data.
+The sole accepted KDF profile is Argon2id v19, 64 MiB, three passes, four lanes,
+32-byte output and 16-byte salt. Parsing is bounded to 4096 bytes; duplicate JSON
+fields, unknown versions/profiles, malformed encoding and excessive password
+inputs are rejected before expensive derivation. Passwords use exact UTF-8 bytes,
+without normalization, and must contain 1–1024 encoded bytes.
+
+Each initialization generates a random 256-bit master key and fresh 96-bit nonce.
+V1 wraps once per fresh password-derived key and does not support password changes
+or rewrapping. HKDF-SHA256 separates database and document purposes using vault
+identity and versioned labels. Passwords and unwrapped keys are never written to
+disk. An optional trusted `expected_vault_id` pins identity when reopening;
+without an external trusted pin, replacing an entire valid envelope cannot be
+detected from that envelope alone.
+
+States are UNINITIALIZED, LOCKED, UNLOCKED and ERROR. Failed unlock drops retained
+keys; authentication failure is retryable LOCKED, malformed/unavailable storage is
+ERROR. Operations on one manager are serialized. Key ownership is encapsulated
+for a future dedicated storage worker; underscore methods are internal integration
+seams, not a Python security boundary. Lock releases references and **does not
+promise secure memory erasure**.
+
+Publication uses an exclusive directory and pending file, fsync, then an atomic
+no-overwrite hard link. A filesystem supporting hard links is required (tested on
+Windows NTFS). An interruption before publication leaves an ERROR directory for
+manual inspection; incomplete pending files are never adopted. Publication is the
+commit point: if removal of the extra encrypted pending hard link fails, the
+operation reports an error but the published vault stays LOCKED and can be
+unlocked normally. Initialization still refuses to overwrite it. The implementation
+never silently repairs a vault. Windows access control inherits
+the parent directory ACL; Unix creation modes do not establish a private Windows
+ACL. Use a trusted user-owned parent. These path checks do not defeat a privileged
+local attacker racing filesystem changes or guarantee power-loss durability.
+
+Development endpoints remain available. External vault mode stays locked even
+when this internal manager is UNLOCKED. Existing uploads, SQLite and Chroma are
+still plaintext: this task does not encrypt documents, migrate SQLCipher, integrate
+production retrieval, implement password recovery, or contain paging/crash dumps.
+
+- Cryptography reference: [AES-GCM](https://cryptography.io/en/latest/hazmat/primitives/aead/).
+- KDF reference: [Argon2 parameters](https://argon2-cffi.readthedocs.io/en/stable/parameters.html).
+
 - `backend/app/__init__.py`: marks `app` as a Python package.
 - `backend/app/main.py`: creates the FastAPI application and registers routes.
   `@app.get(...)` is similar to Express `app.get(path, handler)`; returning
